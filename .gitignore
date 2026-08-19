@@ -1,4 +1,5 @@
+/quiccochet
+.claude/
+real-world/
+test/webrtc-investigation/
 /bin/
-*.pprof
-*.prof
-/test/out/

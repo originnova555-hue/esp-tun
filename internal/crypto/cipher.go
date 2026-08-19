@@ -1,0 +1,217 @@
+package crypto
+
+import (
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+
+	"golang.org/x/crypto/chacha20poly1305"
+)
+
+const (
+	// NonceSize is the size of the nonce for ChaCha20-Poly1305
+	NonceSize = chacha20poly1305.NonceSize // 12 bytes
+	// TagSize is the authentication tag size
+	TagSize = chacha20poly1305.Overhead // 16 bytes
+	// MaxPayloadSize is the maximum size of encrypted payload
+	MaxPayloadSize = 65535 - NonceSize - TagSize
+)
+
+var (
+	ErrPayloadTooLarge = errors.New("payload too large")
+	ErrDecryptFailed   = errors.New("decryption failed: authentication error")
+	ErrReplayedPacket  = errors.New("replayed packet")
+	ErrInvalidNonce    = errors.New("invalid nonce")
+)
+
+const replayWindowSize = 2048
+
+// Cipher handles ChaCha20-Poly1305 encryption/decryption
+type Cipher struct {
+	sendAEAD cipher.AEAD
+	recvAEAD cipher.AEAD
+
+	// Nonce = [noncePrefix:4][counter:8]
+	// noncePrefix is random per session — prevents nonce reuse across restarts
+	noncePrefix [4]byte
+	sendNonce   uint64
+
+	// Replay protection: sliding window on peer's nonce counter.
+	// Tracks the peer's session prefix to auto-reset on restart.
+	// Dead prefixes (previously seen and abandoned) are rejected to
+	// prevent toggle replay attacks where an attacker alternates between
+	// old and current session prefixes to flush the bitmap.
+	replayMu     sync.Mutex
+	peerPrefix   [4]byte
+	prefixSet    bool
+	replayMax    uint64
+	replayBitmap [replayWindowSize / 64]uint64
+	deadPrefixes map[[4]byte]struct{}
+}
+
+// NewCipher creates a new cipher with send and receive keys.
+// A fresh random noncePrefix is generated per instance to prevent nonce
+// reuse across process restarts with the same long-term keys.
+// Replay protection is enforced via a sliding window bitmap (see replayCheck):
+// the peer's prefix is locked on the first authenticated packet and any
+// packet with a different prefix is rejected, since the Cipher lifecycle
+// is bound to a single QUIC session.
+func NewCipher(sendKey, recvKey [KeySize]byte) (*Cipher, error) {
+	sendAEAD, err := chacha20poly1305.New(sendKey[:])
+	if err != nil {
+		return nil, fmt.Errorf("create send cipher: %w", err)
+	}
+
+	recvAEAD, err := chacha20poly1305.New(recvKey[:])
+	if err != nil {
+		return nil, fmt.Errorf("create recv cipher: %w", err)
+	}
+
+	var prefix [4]byte
+	if _, err := rand.Read(prefix[:]); err != nil {
+		return nil, fmt.Errorf("generate nonce prefix: %w", err)
+	}
+
+	return &Cipher{
+		sendAEAD:     sendAEAD,
+		recvAEAD:     recvAEAD,
+		noncePrefix:  prefix,
+		deadPrefixes: make(map[[4]byte]struct{}),
+	}, nil
+}
+
+// EncryptTo encrypts plaintext into the provided buffer.
+// Returns the number of bytes written.
+// Nonce = [sessionPrefix:4][counter:8] — same scheme as Encrypt, zero-alloc.
+func (c *Cipher) EncryptTo(dst, plaintext []byte) (int, error) {
+	if len(plaintext) > MaxPayloadSize {
+		return 0, ErrPayloadTooLarge
+	}
+
+	needed := NonceSize + len(plaintext) + TagSize
+	if len(dst) < needed {
+		return 0, fmt.Errorf("buffer too small: need %d, have %d", needed, len(dst))
+	}
+
+	c.writeNonce(dst[:NonceSize])
+	c.sendAEAD.Seal(dst[NonceSize:NonceSize], dst[:NonceSize], plaintext, nil)
+
+	return needed, nil
+}
+
+// writeNonce writes [noncePrefix:4][counter:8] into dst (must be NonceSize bytes).
+func (c *Cipher) writeNonce(dst []byte) {
+	copy(dst[:4], c.noncePrefix[:])
+	counter := atomic.AddUint64(&c.sendNonce, 1)
+	binary.BigEndian.PutUint64(dst[4:NonceSize], counter)
+}
+
+// DecryptTo decrypts ciphertext into the provided buffer.
+func (c *Cipher) DecryptTo(dst, ciphertext []byte) (int, error) {
+	if len(ciphertext) < NonceSize+TagSize {
+		return 0, ErrInvalidNonce
+	}
+
+	nonce := ciphertext[:NonceSize]
+	encrypted := ciphertext[NonceSize:]
+	plaintextLen := len(encrypted) - TagSize
+
+	if len(dst) < plaintextLen {
+		return 0, fmt.Errorf("buffer too small: need %d, have %d", plaintextLen, len(dst))
+	}
+
+	_, err := c.recvAEAD.Open(dst[:0], nonce, encrypted, nil)
+	if err != nil {
+		return 0, ErrDecryptFailed
+	}
+
+	if !c.replayCheck(nonce) {
+		return 0, ErrReplayedPacket
+	}
+
+	return plaintextLen, nil
+}
+
+// replayCheck checks a nonce against the sliding window.
+// Returns true if the packet is fresh, false if replayed.
+// Auto-resets the window when the peer's session prefix changes (restart).
+func (c *Cipher) replayCheck(nonce []byte) bool {
+	var prefix [4]byte
+	copy(prefix[:], nonce[:4])
+	counter := binary.BigEndian.Uint64(nonce[4:NonceSize])
+
+	c.replayMu.Lock()
+	defer c.replayMu.Unlock()
+
+	// First authenticated packet: lock in the peer's prefix.
+	if !c.prefixSet {
+		c.peerPrefix = prefix
+		c.prefixSet = true
+		c.replayMax = counter
+		c.replayBitmap = [replayWindowSize / 64]uint64{}
+		idx := counter % replayWindowSize
+		c.replayBitmap[idx/64] |= 1 << (idx % 64)
+		return true
+	}
+
+	// Different prefix: either a legitimate peer restart or a toggle replay attack.
+	if prefix != c.peerPrefix {
+		// Dead prefix = previously seen and abandoned → replay attack.
+		if _, dead := c.deadPrefixes[prefix]; dead {
+			return false
+		}
+
+		// Genuinely new prefix → peer restarted. Retire the current prefix.
+		c.deadPrefixes[c.peerPrefix] = struct{}{}
+
+		// Cap the dead set to prevent unbounded growth on long-running servers.
+		if len(c.deadPrefixes) > 256 {
+			c.deadPrefixes = make(map[[4]byte]struct{})
+		}
+
+		c.peerPrefix = prefix
+		c.replayMax = counter
+		c.replayBitmap = [replayWindowSize / 64]uint64{}
+		idx := counter % replayWindowSize
+		c.replayBitmap[idx/64] |= 1 << (idx % 64)
+		return true
+	}
+
+	if counter > c.replayMax {
+		// New high: shift the window
+		diff := counter - c.replayMax
+		if diff >= replayWindowSize {
+			// Entire window is stale, clear it
+			c.replayBitmap = [replayWindowSize / 64]uint64{}
+		} else {
+			// Clear bits that fell out of the window
+			for i := c.replayMax + 1; i <= counter; i++ {
+				idx := i % replayWindowSize
+				c.replayBitmap[idx/64] &^= 1 << (idx % 64)
+			}
+		}
+		c.replayMax = counter
+		// Mark as seen
+		idx := counter % replayWindowSize
+		c.replayBitmap[idx/64] |= 1 << (idx % 64)
+		return true
+	}
+
+	// Below window — too old
+	if c.replayMax-counter >= replayWindowSize {
+		return false
+	}
+
+	// Within window — check bitmap
+	idx := counter % replayWindowSize
+	bit := uint64(1) << (idx % 64)
+	if c.replayBitmap[idx/64]&bit != 0 {
+		return false // already seen
+	}
+	c.replayBitmap[idx/64] |= bit
+	return true
+}

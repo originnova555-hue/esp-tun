@@ -1,0 +1,1186 @@
+package tunnel
+
+import (
+	"context"
+	"crypto/tls"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"log/slog"
+	"math/rand/v2"
+	"net"
+	"os"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/qlog"
+
+	"github.com/pechenyeru/quiccochet/internal/admin"
+	"github.com/pechenyeru/quiccochet/internal/config"
+	"github.com/pechenyeru/quiccochet/internal/crypto"
+	"github.com/pechenyeru/quiccochet/internal/socks"
+	"github.com/pechenyeru/quiccochet/internal/transport"
+)
+
+const (
+	backoffMin    = 500 * time.Millisecond
+	backoffMax    = 30 * time.Second
+	backoffFactor = 2
+	backoffJitter = 0.25 // ±25%
+)
+
+// proxyCopyPool is a global pool for copy buffers to avoid heavy allocations during proxying.
+var proxyCopyPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 32*1024)
+		return &buf
+	},
+}
+
+// Client is the tunnel client
+type Client struct {
+	config *config.Config
+	cipher *crypto.Cipher
+	trans  transport.Transport
+
+	// --- LAZY CONNECTION POOL ---
+	// Connections are created on-demand and cached. If a cached connection
+	// is dead when needed, a new one is dialed inline — no request ever
+	// fails just because a connection died on the spoofed path.
+	tr       *quic.Transport
+	rawConn  *transportPacketConn
+	obfConn  *ObfuscatedConn // nil when obfuscation.mode="none" (fast path)
+	tlsConf  *tls.Config
+	quicConf *quic.Config
+	addr     net.Addr
+	conns    []*quic.Conn
+	nextConn atomic.Uint32
+
+	mu sync.RWMutex
+
+	serverIP   net.IP
+	serverPort uint16
+
+	socksServer *socks.Server
+
+	// UDP association tracking for SOCKS5 UDP ASSOCIATE relay
+	nextAssocID     atomic.Uint32
+	udpAssociations sync.Map // map[uint32]*udpAssoc
+
+	running atomic.Bool
+	stopCh  chan struct{}
+
+	bytesSent     atomic.Uint64
+	bytesReceived atomic.Uint64
+
+	startedAt time.Time
+
+	pprof *admin.PprofServer
+
+	// tlsCert is the deterministic shared-secret-derived certificate
+	// presented to the server; expectedPeerCertHash pins the server's
+	// own derived cert so the QUIC handshake fails unless both peers
+	// share the same X25519 secret.
+	tlsCert              *tls.Certificate
+	expectedPeerCertHash []byte
+}
+
+type udpAssoc struct {
+	conn       *net.UDPConn
+	clientAddr atomic.Pointer[net.UDPAddr]
+}
+
+// NewClient creates a new tunnel client. tlsCert is the deterministic
+// shared-secret-derived certificate the client will present at the QUIC
+// handshake; expectedPeerCertHash is the sha256 of the server's cert
+// derived from the same secret, used to pin the remote cert in
+// VerifyPeerCertificate (Q-02 / Q-03). Both must be non-nil.
+func NewClient(cfg *config.Config, cipher *crypto.Cipher, tlsCert *tls.Certificate, expectedPeerCertHash []byte) (*Client, error) {
+	if tlsCert == nil || len(expectedPeerCertHash) == 0 {
+		return nil, fmt.Errorf("NewClient requires tlsCert and expectedPeerCertHash (derived from the shared secret)")
+	}
+	serverIP := net.ParseIP(cfg.Server.Address)
+	if serverIP == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		ips, err := net.DefaultResolver.LookupIPAddr(ctx, cfg.Server.Address)
+		if err != nil || len(ips) == 0 {
+			return nil, fmt.Errorf("resolve server address: %w", err)
+		}
+		serverIP = ips[0].IP
+	}
+
+	srcIPs4 := config.ParseIPs(cfg.Spoof.SourceIPs)
+	srcIPs6 := config.ParseIPs(cfg.Spoof.SourceIPv6s)
+	peerSpoofIPs4 := config.ParseIPs(cfg.Spoof.PeerSpoofIPs)
+	peerSpoofIPs6 := config.ParseIPs(cfg.Spoof.PeerSpoofIPv6s)
+
+	// Populate the singular canonical field expected by the transport layer
+	// from the first element of each plural list (v2: singular fields are
+	// gone from SpoofConfig; the transport layer still uses them internally).
+	var srcIP4, srcIP6, peerSpoofIP4, peerSpoofIP6 net.IP
+	if len(srcIPs4) > 0 {
+		srcIP4 = srcIPs4[0]
+	}
+	if len(srcIPs6) > 0 {
+		srcIP6 = srcIPs6[0]
+	}
+	if len(peerSpoofIPs4) > 0 {
+		peerSpoofIP4 = peerSpoofIPs4[0]
+	}
+	if len(peerSpoofIPs6) > 0 {
+		peerSpoofIP6 = peerSpoofIPs6[0]
+	}
+
+	transportCfg := &transport.Config{
+		SourceIP:       srcIP4,
+		SourceIPv6:     srcIP6,
+		SourceIPs:      srcIPs4,
+		SourceIPv6s:    srcIPs6,
+		ListenPort:     uint16(cfg.ListenPort),
+		PeerSpoofIP:    peerSpoofIP4,
+		PeerSpoofIPv6:  peerSpoofIP6,
+		PeerSpoofIPs:   peerSpoofIPs4,
+		PeerSpoofIPv6s: peerSpoofIPs6,
+		BufferSize:     cfg.Performance.BufferSize,
+		ReadBuffer:     cfg.Performance.ReadBuffer,
+		WriteBuffer:    cfg.Performance.WriteBuffer,
+		MTU:            cfg.Performance.MTU,
+		ProtocolNumber: cfg.Transport.ProtocolNumber,
+		ICMPEchoID:     cfg.Transport.ICMPEchoID,
+		PacingRateMbps: cfg.Performance.PacingRateMbps,
+	}
+
+	var trans transport.Transport
+	var err error
+
+	switch cfg.Transport.Type {
+	case config.TransportICMP:
+		mode := transport.ICMPModeEcho
+		if cfg.Transport.ICMPMode == config.ICMPModeReply {
+			mode = transport.ICMPModeReply
+		}
+		trans, err = transport.NewICMPTransport(transportCfg, mode)
+	case config.TransportICMPv6:
+		mode := transport.ICMPModeEcho
+		if cfg.Transport.ICMPMode == config.ICMPModeReply {
+			mode = transport.ICMPModeReply
+		}
+		trans, err = transport.NewICMPv6OverIPv4Transport(transportCfg, mode)
+	case config.TransportRAW:
+		trans, err = transport.NewRawTransport(transportCfg)
+	case config.TransportSynUDP:
+		trans, err = transport.NewSynUDPTransport(transportCfg, transport.RoleClient)
+	default:
+		trans, err = transport.NewUDPTransport(transportCfg)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("create transport: %w", err)
+	}
+
+	return &Client{
+		config:               cfg,
+		cipher:               cipher,
+		trans:                trans,
+		serverIP:             serverIP,
+		serverPort:           uint16(cfg.Server.Port),
+		stopCh:               make(chan struct{}),
+		startedAt:            time.Now(),
+		pprof:                admin.NewPprofServer(),
+		tlsCert:              tlsCert,
+		expectedPeerCertHash: expectedPeerCertHash,
+	}, nil
+}
+
+// Start starts the client
+func (c *Client) Start() error {
+	c.running.Store(true)
+
+	slog.Info("starting client", "server", fmt.Sprintf("%s:%d", c.serverIP, c.serverPort))
+
+	rawConn := newClientTransportConn(c.trans, c.serverIP, nil)
+	if c.serverIP != nil {
+		// Seed the server port into the route so the first WriteTo has a
+		// valid destination even before we learn the ephemeral reply port.
+		rawConn.clientRoute.storeRealPeer(&net.UDPAddr{IP: c.serverIP, Port: int(c.serverPort)})
+	}
+	c.rawConn = rawConn
+	// Optional receive-side jitter-smoothing shim; zero-overhead when
+	// performance.jitter_buffer_ms == 0 (returns the input verbatim).
+	netConn := maybeWrapJitterBuffer(rawConn, c.config.Performance.JitterBufferMs, "client")
+
+	// Obfuscator fast-path: in mode="none" the obfuscator is a no-op of
+	// security value (QUIC already has TLS end-to-end) but imposes a
+	// per-packet tax: 1 memcpy into the plaintext buffer, 1 ChaCha20-Poly1305
+	// encryption, 2×sync.Pool Get/Put, 3-byte framing header. Skipping the
+	// wrapper entirely removes all of it. For paranoid/standard we still
+	// need the padding + framing, so the wrapper runs as before.
+	var quicConn net.PacketConn = netConn
+	if c.config.Obfuscation.Mode != string(config.ObfuscationNone) {
+		obfConn := NewObfuscatedConn(netConn, c.cipher, c.config)
+		c.obfConn = obfConn
+		quicConn = obfConn
+	} else {
+		slog.Info("obfuscator bypassed — fast path", "component", "quic", "reason", "obfuscation.mode=none")
+	}
+
+	// quic.Transport allows us to multiplex MULTIPLE QUIC connections over a SINGLE net.PacketConn
+	c.tr = &quic.Transport{
+		Conn: quicConn,
+	}
+
+	verify := crypto.MakeVerifyPeerCertificate(c.expectedPeerCertHash)
+	c.tlsConf = &tls.Config{
+		Certificates: []tls.Certificate{*c.tlsCert},
+		// InsecureSkipVerify disables Go's chain validation (the
+		// server cert is self-signed) but VerifyPeerCertificate is
+		// still invoked, and it is the actual authentication
+		// mechanism: it pins the server's leaf to the sha256 of the
+		// shared-secret-derived cert. Without the matching shared
+		// secret an attacker cannot present a passing certificate.
+		InsecureSkipVerify:    true, //nolint:gosec
+		NextProtos:            []string{"quiccochet-v2"},
+		MinVersion:            tls.VersionTLS13,
+		ServerName:            "quiccochet.local",
+		VerifyPeerCertificate: verify,
+		// LRU cache of TLS session tickets so post-drop reconnects skip
+		// the full handshake (saves 1 RTT, very visible on high-RTT
+		// links). 64 entries covers the pool size * reasonable churn.
+		ClientSessionCache: tls.NewLRUClientSessionCache(64),
+	}
+
+	c.quicConf = &quic.Config{
+		KeepAlivePeriod:                time.Duration(c.config.QUIC.KeepAlivePeriodSec) * time.Second,
+		MaxIdleTimeout:                 time.Duration(c.config.QUIC.MaxIdleTimeoutSec) * time.Second,
+		InitialStreamReceiveWindow:     initialStreamReceiveWindow,
+		MaxStreamReceiveWindow:         uint64(c.config.QUIC.MaxStreamReceiveWindow),
+		InitialConnectionReceiveWindow: initialConnectionReceiveWindow,
+		MaxConnectionReceiveWindow:     uint64(c.config.QUIC.MaxConnectionReceiveWindow),
+		MaxIncomingStreams:             int64(c.config.QUIC.MaxIncomingStreams),
+		MaxIncomingUniStreams:          int64(c.config.QUIC.MaxIncomingUniStreams),
+		EnableDatagrams:                true,
+		DisablePathMTUDiscovery:        !c.config.QUIC.EnablePathMTUDiscovery,
+		InitialPacketSize:              initialPacketSize(c.config.Performance.MTU),
+		// 0-RTT disabled; we keep only 1-RTT resumption. See server.go
+		// for the replay-safety rationale.
+		Allow0RTT: false,
+		// qlog tracer — no-op unless QLOGDIR env var points to a
+		// writable directory, at which point one .sqlog file per
+		// connection is produced (inspect with qvis / qlog-tools).
+		Tracer: qlog.DefaultConnectionTracer,
+	}
+	applyCongestionControl(c.quicConf, c.config.QUIC.CongestionControl, "client")
+	// Apply the global packet-reorder threshold once, pre-connection.
+	// See QUICConfig.PacketThreshold for rationale.
+	quic.SetPacketThreshold(int64(c.config.QUIC.PacketThreshold))
+	logQUICConfig(c.quicConf, "client", c.config.QUIC.PacketThreshold)
+
+	c.addr = &net.UDPAddr{IP: c.serverIP, Port: int(c.serverPort)}
+
+	// --- INITIALIZE THE CONNECTION POOL ---
+	poolSize := c.config.QUIC.PoolSize
+	if poolSize <= 0 {
+		poolSize = 4
+	}
+	c.conns = make([]*quic.Conn, poolSize)
+
+	// First connection with backoff — blocks until server is reachable
+	slog.Info("connecting to server", "component", "quic", "pool_size", poolSize)
+	first, err := c.dialWithBackoff()
+	if err != nil {
+		return err // stopCh was closed
+	}
+	c.conns[0] = first
+
+	// Remaining connections in parallel
+	if poolSize > 1 {
+		var wg sync.WaitGroup
+		for i := 1; i < poolSize; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				conn, dialErr := c.dialWithBackoff()
+				if dialErr != nil {
+					return // stopCh closed
+				}
+				c.mu.Lock()
+				c.conns[idx] = conn
+				c.mu.Unlock()
+			}(i)
+		}
+		wg.Wait()
+	}
+
+	slog.Info("pool established", "component", "quic", "connections", poolSize)
+
+	// Start datagram receivers for UDP relay
+	for _, conn := range c.conns {
+		if conn != nil {
+			go c.receiveDatagrams(conn)
+			go c.acceptReverseStreams(conn)
+		}
+	}
+
+	// Start the pool health-checker in background
+	go c.maintainPool()
+
+	// Start the active defense chaff ticker (paranoid mode only).
+	// When obfuscation.mode="none" we bypass the obfuscator entirely so
+	// obfConn is nil; chaffTicker is paranoid-only anyway, so skip.
+	if c.obfConn != nil {
+		go c.chaffTicker(c.obfConn, c.addr)
+	}
+
+	// Periodic stats for diagnostics
+	go c.statsTicker()
+
+	errCh := make(chan error, len(c.config.Inbounds))
+	for _, inb := range c.config.Inbounds {
+		switch inb.Type {
+		case config.InboundSocks:
+			var auth *socks.AuthCreds
+			if inb.Auth != nil {
+				auth = &socks.AuthCreds{Username: inb.Auth.Username, Password: inb.Auth.Password}
+			}
+			// Loud warning when a non-loopback listener has no auth
+			// configured: it is almost certainly a misconfiguration
+			// (typo in listen, container with --network host, etc.)
+			// and we would otherwise be an open relay.
+			if auth == nil && !isLoopbackListen(inb.Listen) {
+				slog.Warn("SOCKS5 inbound exposed without auth — anyone reaching this listener gets a free proxy",
+					"component", "socks5", "listen", inb.Listen)
+			}
+			go func(listen string, auth *socks.AuthCreds) {
+				slog.Info("inbound started", "component", "socks5", "listen", listen, "auth", auth != nil)
+				socksServer, err := socks.NewStreamServer(listen, c.handleStream, c.handleUDP, auth)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				c.socksServer = socksServer
+				errCh <- socksServer.Serve()
+			}(inb.Listen, auth)
+		case config.InboundForward:
+			go func(listen, target string) {
+				slog.Info("inbound started", "component", "forward", "listen", listen, "target", target)
+				errCh <- c.startForwardInbound(listen, target)
+			}(inb.Listen, inb.Target)
+		}
+	}
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-c.stopCh:
+		return nil
+	}
+}
+
+// srcPool returns the SrcPool of the underlying transport when it
+// implements the optional accessor; nil otherwise. Used by maintainPool
+// to feed conn-death signals into the IP health-check.
+func (c *Client) srcPool() *transport.SrcPool {
+	type poolProvider interface {
+		SrcPool() *transport.SrcPool
+	}
+	if pp, ok := c.trans.(poolProvider); ok {
+		return pp.SrcPool()
+	}
+	return nil
+}
+
+// ipv4String / ipv6String are throwaway helpers for the maintainPool
+// blame log lines. We don't import net just to format a [4]byte.
+func ipv4String(a [4]byte) string {
+	return net.IP(a[:]).String()
+}
+
+func ipv6String(a [16]byte) string {
+	return net.IP(a[:]).String()
+}
+
+// maintainPool runs in background and revives dead QUIC connections with exponential backoff.
+func (c *Client) maintainPool() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	backoffs := make([]time.Duration, len(c.conns))
+	lastFail := make([]time.Time, len(c.conns))
+	// wasAlive[i] tracks whether slot i had a live conn at the previous
+	// tick. A transition alive→dead is the IP-health-check signal we
+	// pass to SrcPool.MarkConnDead. A slot that was never alive (e.g.
+	// initial dial failure) does not blame any IP — the server may be
+	// down, or the IP may simply never have been used yet.
+	wasAlive := make([]bool, len(c.conns))
+	srcPool := c.srcPool()
+	// Resurrect pass cadence: every resurrectInterval the pool clears
+	// expired cooldowns. Fast enough to recover quickly from a transient
+	// blackhole; slow enough not to thrash the pool state.
+	const resurrectInterval = 5 * time.Second
+	lastResurrect := time.Now()
+
+	for c.running.Load() {
+		select {
+		case <-c.stopCh:
+			return
+		case <-ticker.C:
+			// Resurrect expired cooldowns (whether or not anything died
+			// this tick). Cheap when nothing's quarantined.
+			if srcPool != nil && time.Since(lastResurrect) >= resurrectInterval {
+				srcPool.Resurrect()
+				lastResurrect = time.Now()
+			}
+
+			// Detect dead slots via QUIC connection context. For each
+			// alive→dead transition, blame an IP via SrcPool.MarkConnDead.
+			c.mu.RLock()
+			var deadSlots []int
+			var skipped []int
+			var newlyDead int
+			for i, conn := range c.conns {
+				alive := conn != nil && conn.Context().Err() == nil
+				if !alive && wasAlive[i] {
+					newlyDead++
+				}
+				wasAlive[i] = alive
+				if !alive {
+					if backoffs[i] == 0 || time.Since(lastFail[i]) >= backoffs[i] {
+						deadSlots = append(deadSlots, i)
+					} else {
+						skipped = append(skipped, i)
+					}
+				}
+			}
+			c.mu.RUnlock()
+
+			// One MarkConnDead per newly-dead slot. The pool itself
+			// applies the threshold + min-healthy guards; here we only
+			// pass the signal.
+			if srcPool != nil {
+				for range newlyDead {
+					if ip, ok := srcPool.MarkConnDeadV4(); ok {
+						slog.Warn("ip health-check: quarantined v4 source",
+							"component", "quic", "ip", ipv4String(ip))
+					}
+					if ip, ok := srcPool.MarkConnDeadV6(); ok {
+						slog.Warn("ip health-check: quarantined v6 source",
+							"component", "quic", "ip", ipv6String(ip))
+					}
+				}
+			}
+
+			if len(skipped) > 0 {
+				slog.Debug("pool tick: dead slots in backoff", "component", "quic", "skipped", skipped)
+			}
+
+			if len(deadSlots) == 0 {
+				slog.Debug("pool tick: all slots healthy", "component", "quic", "pool_size", len(c.conns))
+				continue
+			}
+
+			slog.Debug("pool tick: reconnecting dead slots", "component", "quic", "dead", deadSlots)
+
+			// Reconnect dead slots in parallel
+			type reconnResult struct {
+				idx  int
+				conn *quic.Conn
+				err  error
+			}
+			results := make(chan reconnResult, len(deadSlots))
+
+			for _, idx := range deadSlots {
+				go func(i int) {
+					slog.Debug("pool reconnect: dial start", "component", "quic", "conn", i, "timeout_sec", 3)
+					dialStart := time.Now()
+					dialCtx, dialCancel := context.WithTimeout(context.Background(), 3*time.Second)
+					// Cancel dial immediately if client is stopping
+					go func() {
+						select {
+						case <-c.stopCh:
+							dialCancel()
+						case <-dialCtx.Done():
+						}
+					}()
+					conn, err := c.tr.Dial(dialCtx, c.addr, c.tlsConf, c.quicConf)
+					dialCancel()
+					slog.Debug("pool reconnect: dial returned", "component", "quic", "conn", i, "elapsed", time.Since(dialStart).Round(time.Millisecond), "ok", err == nil)
+					results <- reconnResult{i, conn, err}
+				}(idx)
+			}
+
+			// Collect results without holding the lock so handleStream/handleUDP
+			// aren't blocked during the 3s dial timeout
+			collected := make([]reconnResult, 0, len(deadSlots))
+			for range deadSlots {
+				collected = append(collected, <-results)
+			}
+
+			c.mu.Lock()
+			for _, r := range collected {
+				if r.err != nil {
+					if backoffs[r.idx] == 0 {
+						backoffs[r.idx] = backoffMin
+					} else {
+						backoffs[r.idx] = min(backoffs[r.idx]*backoffFactor, backoffMax)
+					}
+					backoffs[r.idx] = addJitter(backoffs[r.idx])
+					lastFail[r.idx] = time.Now()
+					slog.Warn("pool reconnect failed", "component", "quic", "conn", r.idx, "retry_in", backoffs[r.idx].Round(time.Millisecond), "error", r.err)
+				} else {
+					c.conns[r.idx] = r.conn
+					backoffs[r.idx] = 0
+					go c.receiveDatagrams(r.conn)
+					go c.acceptReverseStreams(r.conn)
+					slog.Info("pool restored", "component", "quic", "conn", r.idx)
+				}
+			}
+			c.mu.Unlock()
+		}
+	}
+}
+
+// dialWithBackoff retries quic.Transport.Dial with exponential backoff until
+// it succeeds or the client is stopped. Returns (nil, error) only on shutdown.
+func (c *Client) dialWithBackoff() (*quic.Conn, error) {
+	// Base context that cancels when stopCh closes. The defer ensures the
+	// watcher goroutine below exits via baseCtx.Done() once we return,
+	// otherwise it would stay parked on <-c.stopCh and accumulate one
+	// goroutine per successful dial across the lifetime of the process.
+	baseCtx, baseCancel := context.WithCancelCause(context.Background())
+	defer baseCancel(nil)
+	go func() {
+		select {
+		case <-c.stopCh:
+			baseCancel(fmt.Errorf("client stopped"))
+		case <-baseCtx.Done():
+		}
+	}()
+
+	delay := backoffMin
+	for {
+		ctx, cancel := context.WithTimeout(baseCtx, 3*time.Second)
+		conn, err := c.tr.Dial(ctx, c.addr, c.tlsConf, c.quicConf)
+		cancel()
+
+		if err == nil {
+			// Log whether the TLS session was resumed — useful to
+			// confirm the ticket cache is saving us a handshake on
+			// reconnect. DidResume == false on the very first dial
+			// of a fresh process, true on subsequent dials that hit
+			// an unexpired ticket.
+			if conn.ConnectionState().TLS.DidResume {
+				slog.Info("tls session resumed", "component", "quic")
+			}
+			return conn, nil
+		}
+
+		// Check if we were stopped
+		select {
+		case <-c.stopCh:
+			return nil, fmt.Errorf("client stopped during reconnect")
+		default:
+		}
+
+		delay = min(delay, backoffMax)
+		jittered := addJitter(delay)
+
+		slog.Warn("dial failed", "component", "quic", "retry_in", jittered.Round(time.Millisecond), "error", err)
+		slog.Debug("dial backoff: sleeping", "component", "quic", "delay_raw", delay.Round(time.Millisecond), "delay_jittered", jittered.Round(time.Millisecond))
+
+		select {
+		case <-c.stopCh:
+			return nil, fmt.Errorf("client stopped during reconnect")
+		case <-time.After(jittered):
+		}
+
+		delay *= backoffFactor
+	}
+}
+
+// getOrDialConn returns a live QUIC connection from the pool using round-robin.
+// If the selected connection is dead, dials a new one inline and replaces it.
+func (c *Client) getOrDialConn() (*quic.Conn, error) {
+	c.mu.RLock()
+	poolLen := uint32(len(c.conns))
+	c.mu.RUnlock()
+
+	if poolLen == 0 {
+		return nil, fmt.Errorf("pool is empty")
+	}
+
+	base := c.nextConn.Add(1)
+
+	for attempt := range poolLen {
+		idx := (base + attempt) % poolLen
+
+		c.mu.RLock()
+		session := c.conns[idx]
+		c.mu.RUnlock()
+
+		if session != nil && session.Context().Err() == nil {
+			slog.Debug("pool: conn selected", "component", "quic", "conn", idx, "attempt", attempt)
+			return session, nil
+		}
+
+		slog.Debug("pool: conn dead, inline dial", "component", "quic", "conn", idx, "attempt", attempt, "nil", session == nil)
+
+		// Dead or nil — dial a fresh connection inline
+		dialStart := time.Now()
+		dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		newConn, err := c.tr.Dial(dialCtx, c.addr, c.tlsConf, c.quicConf)
+		dialCancel()
+		if err != nil {
+			slog.Warn("inline dial failed", "component", "quic", "conn", idx, "elapsed", time.Since(dialStart).Round(time.Millisecond), "error", err)
+			continue
+		}
+		slog.Debug("pool: inline dial ok", "component", "quic", "conn", idx, "elapsed", time.Since(dialStart).Round(time.Millisecond))
+
+		// Double-check under write lock — another goroutine may have
+		// already installed a connection while we were dialing
+		c.mu.Lock()
+		if existing := c.conns[idx]; existing != nil && existing.Context().Err() == nil {
+			c.mu.Unlock()
+			newConn.CloseWithError(0, "race lost")
+			return existing, nil
+		}
+		c.conns[idx] = newConn
+		c.mu.Unlock()
+
+		go c.receiveDatagrams(newConn)
+		go c.acceptReverseStreams(newConn)
+		slog.Info("connection replaced inline", "component", "quic", "conn", idx)
+		return newConn, nil
+	}
+
+	return nil, fmt.Errorf("all dial attempts failed")
+}
+
+// isLoopbackListen reports whether a listen string binds to a loopback
+// address. Empty host or 0.0.0.0 / :: are treated as bind-all (NOT
+// loopback) so a missing host triggers the "no auth, exposed" warning.
+func isLoopbackListen(listen string) bool {
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		// Best-effort: if it doesn't parse, assume the worst.
+		return false
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+func addJitter(d time.Duration) time.Duration {
+	jitter := float64(d) * backoffJitter * (2*rand.Float64() - 1) // ±25%
+	return d + time.Duration(jitter)
+}
+
+func (c *Client) handleStream(target string, tcpConn net.Conn) error {
+	defer tcpConn.Close()
+
+	slog.Debug("stream: handle begin", "component", "quic", "target", target)
+
+	// --- LAZY POOL: get or create connection ---
+	session, err := c.getOrDialConn()
+	if err != nil {
+		slog.Debug("stream: no conn", "component", "quic", "target", target, "error", err)
+		return fmt.Errorf("no quic connection available: %w", err)
+	}
+
+	openStart := time.Now()
+	openCtx, openCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	stream, err := session.OpenStreamSync(openCtx)
+	openCancel()
+	if err != nil {
+		slog.Debug("stream: open failed", "component", "quic", "target", target, "elapsed", time.Since(openStart).Round(time.Millisecond), "error", err)
+		return fmt.Errorf("open quic stream: %w", err)
+	}
+	slog.Debug("stream: opened", "component", "quic", "target", target, "stream_id", int64(stream.StreamID()), "elapsed", time.Since(openStart).Round(time.Millisecond))
+	defer stream.Close()
+
+	targetData := []byte(target)
+	if len(targetData) > 255 {
+		return fmt.Errorf("target address too long")
+	}
+
+	header := []byte{byte(len(targetData))}
+	_, err = stream.Write(header)
+	if err != nil {
+		return err
+	}
+	_, err = stream.Write(targetData)
+	if err != nil {
+		return err
+	}
+
+	errCh := make(chan error, 2)
+
+	go func() {
+		bufPtr := proxyCopyPool.Get().(*[]byte)
+		defer proxyCopyPool.Put(bufPtr)
+
+		n, err := io.CopyBuffer(stream, tcpConn, *bufPtr)
+		c.bytesSent.Add(uint64(n))
+		errCh <- err
+	}()
+
+	go func() {
+		bufPtr := proxyCopyPool.Get().(*[]byte)
+		defer proxyCopyPool.Put(bufPtr)
+
+		n, err := io.CopyBuffer(tcpConn, stream, *bufPtr)
+		c.bytesReceived.Add(uint64(n))
+		errCh <- err
+	}()
+
+	firstErr := <-errCh
+	slog.Debug("stream: first copy done", "component", "quic", "stream_id", int64(stream.StreamID()), "target", target, "err", firstErr)
+
+	// If the first copy ended with an error (not clean EOF), the transfer
+	// is already broken — no point waiting for the other half to drain.
+	// Cancel the stream now so the second goroutine unblocks immediately.
+	if firstErr != nil {
+		stream.CancelRead(0)
+		stream.CancelWrite(0)
+	}
+
+	done := make(chan struct{})
+	go func() { <-errCh; close(done) }()
+
+	timer := time.NewTimer(time.Duration(c.config.QUIC.StreamCloseTimeoutSec) * time.Second)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+		slog.Debug("stream: closed cleanly", "component", "quic", "stream_id", int64(stream.StreamID()), "target", target)
+	case <-timer.C:
+		slog.Debug("stream: close timeout, forcing cancel", "component", "quic", "stream_id", int64(stream.StreamID()), "target", target, "timeout_sec", c.config.QUIC.StreamCloseTimeoutSec)
+		stream.CancelRead(0)
+		stream.CancelWrite(0)
+		<-done
+	}
+	return nil
+}
+
+// handleUDP relays UDP traffic from a SOCKS5 UDP ASSOCIATE client through QUIC datagrams.
+func (c *Client) handleUDP(tcpConn net.Conn, udpConn *net.UDPConn) error {
+	defer tcpConn.Close()
+	defer udpConn.Close()
+
+	// RFC 1928 §6: the server SHOULD silently drop UDP datagrams whose
+	// source IP does not match the TCP control client's IP. Derive the
+	// expected IP once here; if the remote address is not a *net.TCPAddr
+	// (should not occur with a standard listener) we skip enforcement
+	// rather than reject all packets.
+	var expectedClientIP net.IP
+	if tcpRemote, ok := tcpConn.RemoteAddr().(*net.TCPAddr); ok {
+		expectedClientIP = tcpRemote.IP
+	}
+
+	assocID := c.nextAssocID.Add(1)
+	assoc := &udpAssoc{conn: udpConn}
+	c.udpAssociations.Store(assocID, assoc)
+	defer c.udpAssociations.Delete(assocID)
+
+	slog.Debug("udp: association begin", "component", "socks5", "assoc_id", assocID)
+	defer slog.Debug("udp: association end", "component", "socks5", "assoc_id", assocID)
+
+	buf := make([]byte, 65535)
+
+	// Monitor TCP control connection — close means end of association
+	tcpDone := make(chan struct{})
+	go func() {
+		io.Copy(io.Discard, tcpConn)
+		close(tcpDone)
+	}()
+
+	// Shutdown watcher: closing udpConn unblocks the ReadFromUDP below
+	// without requiring a per-iteration SetReadDeadline syscall.
+	go func() {
+		select {
+		case <-tcpDone:
+		case <-c.stopCh:
+		}
+		udpConn.Close()
+	}()
+
+	for {
+		n, clientAddr, err := udpConn.ReadFromUDP(buf)
+		if err != nil {
+			// Either we were asked to stop (clean exit) or a real error.
+			select {
+			case <-tcpDone:
+				return nil
+			case <-c.stopCh:
+				return nil
+			default:
+			}
+			return err
+		}
+
+		// RFC 1928 §6: silently drop datagrams from unexpected sources
+		// before recording clientAddr, so a hostile local process cannot
+		// hijack the association by sending the first packet.
+		if expectedClientIP != nil && !clientAddr.IP.Equal(expectedClientIP) {
+			continue
+		}
+
+		assoc.clientAddr.Store(clientAddr)
+
+		// SOCKS5 UDP: [RSV:2][FRAG:1][ATYP...][DATA]
+		if n < 4 || buf[2] != 0x00 {
+			continue // drop fragments and malformed packets
+		}
+
+		// Skip RSV(2) + FRAG(1), keep ATYP+ADDR+PORT+DATA
+		addrAndData := buf[3:n]
+
+		// Build QUIC datagram: [AssocID:4][ATYP+ADDR+PORT+DATA]
+		pktSize := 4 + len(addrAndData)
+		pkt, putPkt := getDatagramBuf(pktSize)
+		binary.BigEndian.PutUint32(pkt[0:4], assocID)
+		copy(pkt[4:], addrAndData)
+
+		// Pin this assoc to a single pool connection. Round-robin per
+		// datagram would land each packet on a different QUIC session,
+		// and on the server each session has its own routes map → the
+		// same (assoc, target) pair would get pool_size independent
+		// sockets, multiplying the NAT-mapping count by pool_size and
+		// breaking ICE for any peer-to-peer media stream that depends on
+		// a stable external endpoint (Discord/WhatsApp video). Hashing
+		// by assocID gives a deterministic, stable mapping of UDP flows
+		// to pool connections without needing per-assoc state.
+		c.mu.RLock()
+		if poolN := uint32(len(c.conns)); poolN > 0 {
+			idx := assocID % poolN
+			sess := c.conns[idx]
+			if sess == nil || sess.Context().Err() != nil {
+				// Pinned conn is dead — fall back to a linear scan for
+				// the first live conn so the flow stays alive instead
+				// of blackholing until reconnect. Reorder will be
+				// reintroduced briefly until the pool heals; that's
+				// strictly preferable to a frozen call.
+				for i := range poolN {
+					alt := c.conns[(idx+i)%poolN]
+					if alt != nil && alt.Context().Err() == nil {
+						sess = alt
+						break
+					}
+				}
+			}
+			if sess != nil && sess.Context().Err() == nil {
+				if err := sess.SendDatagram(pkt); err != nil {
+					slog.Debug("udp: datagram send failed", "component", "socks5", "assoc_id", assocID, "conn", idx, "size", pktSize, "error", err)
+				} else {
+					c.bytesSent.Add(uint64(n))
+				}
+			} else {
+				slog.Debug("udp: no live conn, dropping", "component", "socks5", "assoc_id", assocID)
+			}
+		}
+		c.mu.RUnlock()
+		putPkt()
+	}
+}
+
+// receiveDatagrams handles UDP replies from the server via QUIC datagrams.
+func (c *Client) receiveDatagrams(sess *quic.Conn) {
+	slog.Debug("datagram receiver: start", "component", "quic")
+	defer slog.Debug("datagram receiver: exit", "component", "quic")
+	for c.running.Load() {
+		msg, err := sess.ReceiveDatagram(context.Background())
+		if err != nil {
+			slog.Debug("datagram receiver: receive error", "component", "quic", "error", err)
+			return
+		}
+		if len(msg) < 7 {
+			continue
+		}
+
+		assocID := binary.BigEndian.Uint32(msg[0:4])
+		val, ok := c.udpAssociations.Load(assocID)
+		if !ok {
+			continue
+		}
+
+		assoc := val.(*udpAssoc)
+		clientAddr := assoc.clientAddr.Load()
+		if clientAddr == nil {
+			continue
+		}
+
+		// Rebuild SOCKS5 UDP response: [RSV:0,0][FRAG:0][ATYP+ADDR+PORT+DATA]
+		addrAndData := msg[4:]
+		reply, putReply := getDatagramBuf(3 + len(addrAndData))
+		reply[0] = 0 // RSV
+		reply[1] = 0
+		reply[2] = 0 // FRAG
+		copy(reply[3:], addrAndData)
+
+		_, _ = assoc.conn.WriteToUDP(reply, clientAddr)
+		c.bytesReceived.Add(uint64(len(addrAndData)))
+		putReply()
+	}
+}
+
+func (c *Client) startForwardInbound(listenAddr, target string) error {
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+
+	// Close the listener as soon as Stop fires so Accept returns
+	// promptly instead of waiting for the next inbound connection.
+	go func() {
+		<-c.stopCh
+		_ = ln.Close()
+	}()
+
+	for c.running.Load() {
+		conn, err := ln.Accept()
+		if err != nil {
+			// Accept only fails on listener close (Stop) or a real
+			// listener-level error. Either way, exit instead of
+			// busy-spinning on the same error forever.
+			return nil
+		}
+		go c.handleStream(target, conn)
+	}
+	return nil
+}
+
+// statsTicker logs pool health and UDP association counts every 30s for diagnostics.
+func (c *Client) statsTicker() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case <-ticker.C:
+			c.mu.RLock()
+			alive := 0
+			for _, conn := range c.conns {
+				if conn != nil && conn.Context().Err() == nil {
+					alive++
+				}
+			}
+			total := len(c.conns)
+			c.mu.RUnlock()
+
+			udpCount := 0
+			c.udpAssociations.Range(func(_, _ any) bool {
+				udpCount++
+				return true
+			})
+
+			fds := -1
+			if entries, err := os.ReadDir("/proc/self/fd"); err == nil {
+				fds = len(entries)
+			}
+
+			slog.Log(context.Background(), c.config.StatsLogLevel(),
+				"client stats", "component", "stats",
+				"pool_alive", alive, "pool_total", total,
+				"udp_assocs", udpCount,
+				"bytes_sent", c.bytesSent.Load(), "bytes_received", c.bytesReceived.Load(),
+				"open_fds", fds)
+		}
+	}
+}
+
+// chaffTicker sends dummy packets at jittered intervals in paranoid mode
+// to fill idle gaps and defeat traffic analysis without creating a
+// perfectly periodic fingerprint.
+func (c *Client) chaffTicker(obfConn *ObfuscatedConn, addr net.Addr) {
+	if c.config.Obfuscation.Mode != string(config.ObfuscationParanoid) {
+		return
+	}
+
+	base := time.Duration(c.config.Obfuscation.ChaffingIntervalMs) * time.Millisecond
+	if base <= 0 {
+		base = 50 * time.Millisecond
+	}
+
+	for {
+		jitter := time.Duration(rand.Int64N(int64(base/2))) - base/4 // ±25%
+		select {
+		case <-c.stopCh:
+			return
+		case <-time.After(base + jitter):
+			lastSend := time.Unix(0, obfConn.lastSendTime.Load())
+			if time.Since(lastSend) >= base {
+				obfConn.SendChaff(addr)
+			}
+		}
+	}
+}
+
+func (c *Client) Stop() error {
+	if !c.running.Swap(false) {
+		return nil
+	}
+	close(c.stopCh)
+
+	// Mark rawConn closed so ReadFrom propagates the pending read error
+	// to quic-go for a clean shutdown (instead of absorbing it).
+	if c.rawConn != nil {
+		c.rawConn.closed.Store(true)
+	}
+
+	// Set immediate read deadline to unblock any pending transport reads.
+	// This must happen before locking mu, since maintainPool may hold it
+	// while blocked on dial results that depend on transport reads.
+	type deadliner interface {
+		SetReadDeadline(time.Time) error
+	}
+	if d, ok := c.trans.(deadliner); ok {
+		d.SetReadDeadline(time.Now())
+	}
+
+	// Close all connections in the pool gracefully
+	c.mu.Lock()
+	if c.tr != nil {
+		for _, conn := range c.conns {
+			if conn != nil {
+				conn.CloseWithError(0, "client stopping")
+			}
+		}
+		c.tr.Close()
+	}
+	c.mu.Unlock()
+
+	if c.socksServer != nil {
+		c.socksServer.Close()
+	}
+	return c.trans.Close()
+}
+
+func (c *Client) Stats() (sent, received uint64) {
+	return c.bytesSent.Load(), c.bytesReceived.Load()
+}
+
+// StartPprof/StopPprof/PprofStatus delegate to the embedded
+// admin.PprofServer so the Client satisfies admin.PprofBackend.
+// Listener binds lazily — until Start, zero runtime cost.
+// Config satisfies admin.ConfigBackend by returning the *running*
+// configuration the daemon was started with. Returned by reference,
+// not deep-copied: the admin marshalling path is read-only and any
+// future mutation hook would clone before mutating.
+func (c *Client) Config() *config.Config { return c.config }
+
+// ForceResurrect satisfies admin.SrcpoolBackend. With ip == "" it
+// clears every active cooldown across the v4 + v6 sets and returns
+// the count flipped. With a specific ip it parses and force-clears
+// that single entry; ipFound reports whether the entry was on
+// cooldown at the time of the call. Returns an error only when the
+// pool isn't available (transport doesn't expose one) or the IP
+// fails to parse / isn't in the pool.
+func (c *Client) ForceResurrect(ip string) (int, bool, error) {
+	pool := c.srcPool()
+	if pool == nil {
+		return 0, false, fmt.Errorf("transport %q does not expose a srcpool", c.config.Transport.Type)
+	}
+	if ip == "" {
+		return pool.ForceResurrectAll(), false, nil
+	}
+	found, err := pool.ForceResurrectIP(ip)
+	if err != nil {
+		return 0, false, err
+	}
+	if found {
+		return 1, true, nil
+	}
+	return 0, false, nil
+}
+
+func (c *Client) StartPprof(addr string) (admin.PprofStatus, error) {
+	return c.pprof.Start(addr)
+}
+func (c *Client) StopPprof() error               { return c.pprof.Stop() }
+func (c *Client) PprofStatus() admin.PprofStatus { return c.pprof.Status() }
+
+// Snapshot returns a point-in-time view of client state for the
+// admin `stats` command. Pool liveness is counted under the conns
+// lock; UDP associations are iterated via sync.Map. Open FDs come
+// from /proc/self/fd and returns -1 on read failure.
+func (c *Client) Snapshot() admin.Snapshot {
+	c.mu.RLock()
+	alive := 0
+	var pktsSent, pktsLost, bytesLost uint64
+	for _, conn := range c.conns {
+		if conn != nil && conn.Context().Err() == nil {
+			alive++
+			st := conn.ConnectionStats()
+			pktsSent += st.PacketsSent
+			pktsLost += st.PacketsLost
+			bytesLost += st.BytesLost
+		}
+	}
+	total := len(c.conns)
+	c.mu.RUnlock()
+
+	udpCount := 0
+	c.udpAssociations.Range(func(_, _ any) bool {
+		udpCount++
+		return true
+	})
+
+	return admin.Snapshot{
+		Role:          "client",
+		PoolAlive:     alive,
+		PoolTotal:     total,
+		UDPAssocs:     udpCount,
+		BytesSent:     c.bytesSent.Load(),
+		BytesReceived: c.bytesReceived.Load(),
+		PacketsSent:   pktsSent,
+		PacketsLost:   pktsLost,
+		BytesLost:     bytesLost,
+		OpenFDs:       countFDs(),
+		StartedAt:     c.startedAt,
+		UptimeSec:     time.Since(c.startedAt).Seconds(),
+		SpoofIPs:      snapshotSpoofIPs(c.srcPool()),
+	}
+}
+
+// snapshotSpoofIPs converts a SrcPool snapshot into the admin DTO
+// shape. Returns nil if the pool is nil (transport without
+// multi-spoof) so the JSON omits the field.
+func snapshotSpoofIPs(p *transport.SrcPool) []admin.SpoofIPStatus {
+	if p == nil {
+		return nil
+	}
+	now := time.Now()
+	src := p.Snapshot()
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]admin.SpoofIPStatus, 0, len(src))
+	for _, s := range src {
+		st := admin.SpoofIPStatus{
+			IP:            s.IP,
+			Healthy:       s.Healthy,
+			DeathStreak:   s.DeathStreak,
+			CooldownLevel: s.CooldownLevel,
+			SentCount:     s.SentCount,
+		}
+		if !s.CooldownUntil.IsZero() && s.CooldownUntil.After(now) {
+			st.CooldownLeftS = s.CooldownUntil.Sub(now).Seconds()
+		}
+		if s.LastSentAgo > 0 {
+			st.LastSentAgoS = s.LastSentAgo.Seconds()
+		}
+		out = append(out, st)
+	}
+	return out
+}
