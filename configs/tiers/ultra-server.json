@@ -1,0 +1,47 @@
+{
+  "_tier": "Ultra — high-end dedicated box, thousands of concurrent users.",
+  "__usage": "Fill in SERVER_SPOOF_IP / CLIENT_REAL_IP / CLIENT_SPOOF_IP / keys, then run: quiccochet -c ultra-server.json",
+  "___tuning": "tun.queues and quic.pool_size below assume an 8-core box — set both to your actual core count. performance.pacing_rate_mbps should sit slightly below this server's real uplink capacity (e.g. 900 for a 1 Gbps NIC) once you know it; 0 leaves pacing disabled.",
+
+  "mode": "server",
+  "transport": { "type": "udp" },
+  "listen_port": 8080,
+
+  "spoof": { "source_ips": ["SERVER_SPOOF_IP"] },
+  "crypto": { "private_key": "" },
+  "peers": [
+    {
+      "name": "vpn1",
+      "peer_public_key": "",
+      "client_real_ip": "CLIENT_REAL_IP",
+      "peer_spoof_ips": ["CLIENT_SPOOF_IP"],
+      "tun_addr": "10.20.0.2"
+    }
+  ],
+
+  "tun": {
+    "enabled": true,
+    "name": "qc0",
+    "local": "10.20.0.1/24",
+    "mtu": 1360,
+    "queues": 8,
+    "pin_cores": true
+  },
+
+  "obfuscation": { "mode": "none" },
+  "quic": {
+    "pool_size": 16,
+    "congestion_control": "bbrv1",
+    "max_concurrent_sessions": 20000,
+    "udp_route_max": 200000
+  },
+  "performance": {
+    "read_buffer": 33554432,
+    "write_buffer": 33554432,
+    "pacing_rate_mbps": 0
+  },
+
+  "security": { "block_private_targets": true },
+  "logging": { "level": "warn", "file": "" },
+  "metrics": { "enabled": true, "listen": "127.0.0.1:9201" }
+}
