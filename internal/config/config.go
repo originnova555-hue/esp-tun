@@ -146,6 +146,16 @@ type PeerConfig struct {
 	// MUST be disjoint across all PeerConfigs.
 	PeerSpoofIPs   []string `json:"peer_spoof_ips,omitempty"`
 	PeerSpoofIPv6s []string `json:"peer_spoof_ipv6s,omitempty"`
+
+	// TUNAddr is this peer's inner IP address on the server's shared
+	// TUN subnet (e.g. "10.20.0.2"), used only when tun.enabled=true.
+	// It is the routing key the server uses to decide which peer's
+	// QUIC session an inbound-from-TUN packet belongs to: a packet
+	// read from the server's TUN device with this destination IP is
+	// sent to this peer. MUST be disjoint across all PeerConfigs and
+	// MUST fall inside the server's tun.local subnet. Required when
+	// tun.enabled=true in server mode; ignored otherwise.
+	TUNAddr string `json:"tun_addr,omitempty"`
 }
 
 // Config holds all configuration for the tunnel
@@ -165,6 +175,15 @@ type Config struct {
 	Admin         AdminConfig         `json:"admin"`
 	Metrics       MetricsConfig       `json:"metrics"`
 	Inbounds      []InboundConfig     `json:"inbounds"`
+
+	// TUN configures the Layer-3 TUN mode: read/write whole IP packets
+	// directly over the QUIC datagram pool instead of relaying
+	// individual TCP/UDP flows through the SOCKS5 UDP-ASSOCIATE model.
+	// Disabled by default (zero value). Can run alongside SOCKS5/
+	// forward inbounds — TUN datagrams and UDP-relay datagrams share
+	// the wire but are distinguished by a leading type byte (see
+	// internal/tunnel/datagram.go), so enabling both at once is safe.
+	TUN TUNConfig `json:"tun,omitempty"`
 
 	// ReverseForwards is the server-side ssh -R rule list: each rule opens
 	// a TCP listener on the server and tunnels every accepted connection
@@ -433,6 +452,45 @@ type LoggingConfig struct {
 	Level      LogLevel `json:"level"`
 	File       string   `json:"file"`
 	Statistics bool     `json:"statistics"`
+}
+
+// TUNConfig configures Layer-3 TUN mode. When Enabled, the tunnel
+// reads/writes whole IP packets on a persistent TUN interface and
+// carries them as QUIC datagrams — a single point-to-point pipe with
+// no per-inner-flow state on the tunnel's own transport layer (see
+// docs/PROFILING-BASELINE.md for why this replaces the SOCKS5
+// UDP-ASSOCIATE relay model as the primary high-throughput path).
+//
+// The interface is opened once at process startup and its lifetime is
+// intentionally decoupled from the QUIC session pool: a spoof-IP
+// rotation or QUIC reconnect must never recreate it, so routes and
+// iptables/nftables rules an operator layers on top of it stay valid
+// across the tunnel's own reconnects.
+type TUNConfig struct {
+	Enabled bool `json:"enabled"`
+
+	// Name is the interface name, e.g. "qc0". Required when Enabled.
+	Name string `json:"name"`
+
+	// Local is this side's point-to-point address in CIDR form, e.g.
+	// "10.20.0.2/24" (client) or "10.20.0.1/24" (server, matching the
+	// subnet peers[].tun_addr values live in). Required when Enabled.
+	Local string `json:"local"`
+
+	// MTU is the TUN interface MTU. Must leave enough headroom that
+	// whole inner IP packets fit inside a single QUIC datagram after
+	// framing overhead — see initialPacketSize in internal/tunnel;
+	// a TUN MTU larger than the QUIC datagram ceiling causes inner
+	// packets to be silently dropped rather than fragmented. Default
+	// 1360 when unset (safe under the default transport MTU of 1400
+	// plus obfuscator/QUIC/frame-type overhead).
+	MTU int `json:"mtu"`
+
+	// Persist sets TUNSETPERSIST so the interface (and any routes an
+	// operator has attached to it) survives this process restarting,
+	// e.g. under systemd Restart=always. The manager script is
+	// expected to tear it down explicitly on tunnel removal.
+	Persist bool `json:"persist"`
 }
 
 // AdminConfig configures the admin Unix socket used for on-demand
@@ -737,6 +795,11 @@ func (c *Config) setDefaults() error {
 		c.Metrics.Listen = "127.0.0.1:9200"
 	}
 
+	// TUN defaults
+	if c.TUN.Enabled && c.TUN.MTU == 0 {
+		c.TUN.MTU = 1360
+	}
+
 	// Default inbound: if no inbounds defined in client mode, create a SOCKS5 listener
 	if len(c.Inbounds) == 0 && c.Mode == ModeClient {
 		c.Inbounds = []InboundConfig{{
@@ -932,6 +995,8 @@ func (c *Config) Validate() error {
 	if c.Performance.MTU < 1231 {
 		errs = append(errs, fmt.Sprintf("performance.mtu=%d is below the minimum 1231 (quic-go requires 1200-byte packets + 31 bytes of obfuscator overhead)", c.Performance.MTU))
 	}
+
+	errs = append(errs, c.validateTUN()...)
 
 	// Jitter buffer: 0=off, -1=auto, >0=fixed ms. Reject other values so
 	// a typo doesn't silently get accepted as a disable.
@@ -1135,6 +1200,85 @@ func (c *Config) validateClientSpoof() []string {
 
 	if len(c.Spoof.SourceIPs) == 0 && len(c.Spoof.SourceIPv6s) == 0 {
 		errs = append(errs, "at least one spoof source IP (IPv4 or IPv6) is required in spoof.source_ips or spoof.source_ipv6s")
+	}
+
+	return errs
+}
+
+// validateTUN validates the tun{} block. No-op when tun.enabled=false.
+// In server mode, also cross-checks peers[].tun_addr: each must parse,
+// fall inside tun.local's subnet, and be disjoint across peers (it is
+// the routing key the server uses to pick which peer's session an
+// inbound-from-TUN packet belongs to — a collision would silently
+// misroute one peer's traffic to another).
+func (c *Config) validateTUN() []string {
+	var errs []string
+	if !c.TUN.Enabled {
+		return errs
+	}
+
+	if c.TUN.Name == "" {
+		errs = append(errs, "tun.name is required when tun.enabled=true")
+	}
+
+	var localNet *net.IPNet
+	if c.TUN.Local == "" {
+		errs = append(errs, "tun.local is required when tun.enabled=true (CIDR form, e.g. \"10.20.0.2/24\")")
+	} else {
+		_, n, err := net.ParseCIDR(c.TUN.Local)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("tun.local: invalid CIDR %q: %v", c.TUN.Local, err))
+		} else {
+			localNet = n
+		}
+	}
+
+	if c.TUN.MTU != 0 && (c.TUN.MTU < 576 || c.TUN.MTU > 9000) {
+		errs = append(errs, fmt.Sprintf("tun.mtu=%d is out of range (576..9000)", c.TUN.MTU))
+	}
+	// The inner IP packet plus its 1-byte datagram-type prefix (see
+	// internal/tunnel/datagram.go) must fit inside what the transport
+	// MTU can carry after obfuscator overhead — otherwise every inner
+	// packet at the TUN MTU ceiling is silently dropped rather than
+	// tunneled. Mirrors the obfuscatorOverheadBytes budget used to
+	// derive quic.InitialPacketSize from performance.mtu.
+	const (
+		datagramTypeByteOverhead = 1
+		// Mirrors internal/tunnel.obfuscatorOverheadBytes (3-byte framing
+		// + 12-byte ChaCha20-Poly1305 nonce + 16-byte auth tag = 31).
+		// Duplicated here rather than imported to avoid a config<->tunnel
+		// import cycle; internal/tunnel/conn.go asserts the same value.
+		obfuscatorOverheadBytesForValidation = 31
+	)
+	effectiveTUNCeiling := c.Performance.MTU - obfuscatorOverheadBytesForValidation - datagramTypeByteOverhead
+	if c.TUN.MTU > 0 && c.TUN.MTU > effectiveTUNCeiling {
+		errs = append(errs, fmt.Sprintf(
+			"tun.mtu=%d does not fit inside a QUIC datagram at performance.mtu=%d (max usable tun.mtu here is %d — either raise performance.mtu or lower tun.mtu)",
+			c.TUN.MTU, c.Performance.MTU, effectiveTUNCeiling))
+	}
+
+	if c.Mode == ModeServer {
+		tunAddrsSeen := make(map[netip.Addr]string) // addr -> peer name
+		for i, p := range c.Peers {
+			prefix := fmt.Sprintf("peers[%d]", i)
+			if p.TUNAddr == "" {
+				errs = append(errs, fmt.Sprintf("%s: tun_addr is required when tun.enabled=true in server mode", prefix))
+				continue
+			}
+			addr, err := netip.ParseAddr(p.TUNAddr)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("%s: invalid tun_addr %q: %v", prefix, p.TUNAddr, err))
+				continue
+			}
+			if localNet != nil && !localNet.Contains(net.IP(addr.AsSlice())) {
+				errs = append(errs, fmt.Sprintf("%s: tun_addr %s is outside tun.local's subnet %s", prefix, p.TUNAddr, c.TUN.Local))
+			}
+			if owner, dup := tunAddrsSeen[addr]; dup {
+				errs = append(errs, fmt.Sprintf("%s: tun_addr %s is already assigned to peer %q, tun_addr must be disjoint across peers", prefix, p.TUNAddr, owner))
+			} else {
+				tunAddrsSeen[addr] = p.Name
+			}
+		}
 	}
 
 	return errs

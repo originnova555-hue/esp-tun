@@ -1078,3 +1078,107 @@ func TestResolveAdminSocket(t *testing.T) {
 		}
 	})
 }
+
+func TestValidateTUNDisabledIsNoop(t *testing.T) {
+	cfg := validClientConfig()
+	cfg.TUN = TUNConfig{} // disabled
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("disabled tun should not affect validation, got: %v", err)
+	}
+}
+
+func TestValidateTUNClientRequiresNameAndLocal(t *testing.T) {
+	cfg := validClientConfig()
+	cfg.TUN = TUNConfig{Enabled: true}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for tun.enabled with missing name/local")
+	}
+	if !strings.Contains(err.Error(), "tun.name is required") {
+		t.Errorf("expected tun.name error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "tun.local is required") {
+		t.Errorf("expected tun.local error, got: %v", err)
+	}
+}
+
+func TestValidateTUNClientValid(t *testing.T) {
+	cfg := validClientConfig()
+	cfg.TUN = TUNConfig{Enabled: true, Name: "qc0", Local: "10.20.0.2/24", MTU: 1360}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected no error for valid client tun config, got: %v", err)
+	}
+}
+
+func TestValidateTUNBadCIDR(t *testing.T) {
+	cfg := validClientConfig()
+	cfg.TUN = TUNConfig{Enabled: true, Name: "qc0", Local: "not-a-cidr"}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "invalid CIDR") {
+		t.Fatalf("expected invalid CIDR error, got: %v", err)
+	}
+}
+
+func TestValidateTUNMTUTooLargeForDatagram(t *testing.T) {
+	cfg := validClientConfig()
+	cfg.Performance.MTU = 1231 // the validator's own floor
+	cfg.TUN = TUNConfig{Enabled: true, Name: "qc0", Local: "10.20.0.2/24", MTU: 1300}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "does not fit inside a QUIC datagram") {
+		t.Fatalf("expected tun.mtu-too-large error, got: %v", err)
+	}
+}
+
+func TestValidateTUNMTURange(t *testing.T) {
+	cfg := validClientConfig()
+	cfg.TUN = TUNConfig{Enabled: true, Name: "qc0", Local: "10.20.0.2/24", MTU: 100}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "out of range") {
+		t.Fatalf("expected mtu-out-of-range error, got: %v", err)
+	}
+}
+
+func TestValidateTUNServerRequiresPeerTUNAddr(t *testing.T) {
+	cfg := validServerConfig()
+	cfg.TUN = TUNConfig{Enabled: true, Name: "qc0", Local: "10.20.0.1/24"}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "tun_addr is required") {
+		t.Fatalf("expected tun_addr-required error, got: %v", err)
+	}
+}
+
+func TestValidateTUNServerPeerTUNAddrOutsideSubnet(t *testing.T) {
+	cfg := validServerConfig()
+	cfg.TUN = TUNConfig{Enabled: true, Name: "qc0", Local: "10.20.0.1/24"}
+	cfg.Peers[0].TUNAddr = "10.99.0.2"
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "outside tun.local's subnet") {
+		t.Fatalf("expected outside-subnet error, got: %v", err)
+	}
+}
+
+func TestValidateTUNServerPeerTUNAddrDisjoint(t *testing.T) {
+	cfg := validServerConfig()
+	cfg.TUN = TUNConfig{Enabled: true, Name: "qc0", Local: "10.20.0.1/24"}
+	cfg.Peers[0].TUNAddr = "10.20.0.2"
+	second := cfg.Peers[0]
+	second.Name = "vpn2"
+	second.PeerPublicKey = "client-public-key-2"
+	second.PeerSpoofIPs = []string{"10.0.0.4"}
+	second.TUNAddr = "10.20.0.2" // collides with peer 0
+	cfg.Peers = append(cfg.Peers, second)
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "must be disjoint across peers") {
+		t.Fatalf("expected tun_addr disjointness error, got: %v", err)
+	}
+}
+
+func TestValidateTUNServerValid(t *testing.T) {
+	cfg := validServerConfig()
+	cfg.TUN = TUNConfig{Enabled: true, Name: "qc0", Local: "10.20.0.1/24"}
+	cfg.Peers[0].TUNAddr = "10.20.0.2"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected no error for valid server tun config, got: %v", err)
+	}
+}
