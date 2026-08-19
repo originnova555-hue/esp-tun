@@ -1,0 +1,4 @@
+/bin/
+*.pprof
+*.prof
+/test/out/
