@@ -28,6 +28,7 @@ const (
 	tunSetPersist = 0x400454cb
 	iffTun        = 0x0001
 	iffNoPI       = 0x1000
+	iffMultiQueue = 0x0100
 )
 
 type ifReq struct {
@@ -90,7 +91,41 @@ type Device struct {
 // and brings it up. The returned Device's file descriptor is
 // O_NONBLOCK-safe under the Go runtime poller (os.File wraps it with
 // the standard netpoller integration).
+//
+// Equivalent to OpenQueues(cfg, 1)[0] — a single, non-multiqueue
+// device. Use OpenQueues directly when multiple parallel reader/
+// writer goroutines are wanted (see OpenQueues's doc comment).
 func Open(cfg Config) (*Device, error) {
+	devs, err := OpenQueues(cfg, 1)
+	if err != nil {
+		return nil, err
+	}
+	return devs[0], nil
+}
+
+// OpenQueues creates (or attaches to, if persistent and already
+// present) a multiqueue TUN device with n independent queues, each
+// its own kernel-scheduled fd (IFF_MULTI_QUEUE — RSS-style hashing
+// spreads packets across queues by inner flow, same mechanism a
+// multiqueue physical NIC uses). n=1 opens a plain, non-multiqueue
+// device (setting IFF_MULTI_QUEUE for a single queue is harmless but
+// unnecessary).
+//
+// This is the concurrency answer to "batched I/O" for a TUN device:
+// unlike a UDP socket, /dev/net/tun has no recvmmsg/sendmmsg
+// equivalent — a single fd only ever transfers one packet per
+// syscall. Multiple queues let N reader/writer goroutines pull from
+// the kernel in parallel instead of serializing through one fd,
+// which is what actually saturates a multi-core box under load.
+// Pair with a matching number of core-pinned worker goroutines (see
+// config.PerformanceConfig / tier presets).
+//
+// Every returned Device shares the same interface name, address, and
+// MTU (configured once, from the first queue) but has an
+// independently closable fd; callers should treat the returned slice
+// as one logical device split across n readers, and Close() every
+// entry on shutdown.
+func OpenQueues(cfg Config, n int) ([]*Device, error) {
 	if cfg.Name == "" {
 		return nil, fmt.Errorf("tun: name is required")
 	}
@@ -100,40 +135,63 @@ func Open(cfg Config) (*Device, error) {
 	if cfg.Local == "" {
 		return nil, fmt.Errorf("tun: local address is required")
 	}
+	if n < 1 {
+		n = 1
+	}
 	mtu := cfg.MTU
 	if mtu <= 0 {
 		mtu = 1360
 	}
 
-	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR, 0)
-	if err != nil {
-		return nil, fmt.Errorf("tun: open /dev/net/tun: %w", err)
+	flags := uint16(iffTun | iffNoPI)
+	if n > 1 {
+		flags |= iffMultiQueue
 	}
 
-	var req ifReq
-	copy(req.Name[:], cfg.Name)
-	req.Flags = iffTun | iffNoPI
-
-	if err := ioctl(uintptr(fd), tunSetIff, uintptr(unsafe.Pointer(&req))); err != nil {
-		unix.Close(fd)
-		return nil, fmt.Errorf("tun: TUNSETIFF %s: %w", cfg.Name, err)
-	}
-
-	if cfg.Persist {
-		if err := ioctl(uintptr(fd), tunSetPersist, 1); err != nil {
-			unix.Close(fd)
-			return nil, fmt.Errorf("tun: TUNSETPERSIST %s: %w", cfg.Name, err)
+	devs := make([]*Device, 0, n)
+	closeAll := func() {
+		for _, d := range devs {
+			unix.Close(d.fd)
 		}
 	}
 
-	dev := &Device{fd: fd, name: cfg.Name, mtu: mtu}
+	for i := 0; i < n; i++ {
+		fd, err := unix.Open("/dev/net/tun", unix.O_RDWR, 0)
+		if err != nil {
+			closeAll()
+			return nil, fmt.Errorf("tun: open /dev/net/tun: %w", err)
+		}
 
+		var req ifReq
+		copy(req.Name[:], cfg.Name)
+		req.Flags = flags
+
+		if err := ioctl(uintptr(fd), tunSetIff, uintptr(unsafe.Pointer(&req))); err != nil {
+			unix.Close(fd)
+			closeAll()
+			return nil, fmt.Errorf("tun: TUNSETIFF %s (queue %d/%d): %w", cfg.Name, i+1, n, err)
+		}
+
+		if cfg.Persist {
+			if err := ioctl(uintptr(fd), tunSetPersist, 1); err != nil {
+				unix.Close(fd)
+				closeAll()
+				return nil, fmt.Errorf("tun: TUNSETPERSIST %s: %w", cfg.Name, err)
+			}
+		}
+
+		devs = append(devs, &Device{fd: fd, name: cfg.Name, mtu: mtu})
+	}
+
+	// Address/MTU/up is an interface-level property, not per-queue —
+	// configuring it once after all queues are attached is sufficient
+	// and avoids n redundant ioctl round-trips.
 	if err := configureAddr(cfg.Name, cfg.Local, mtu); err != nil {
-		unix.Close(fd)
+		closeAll()
 		return nil, err
 	}
 
-	return dev, nil
+	return devs, nil
 }
 
 // Name returns the interface name.

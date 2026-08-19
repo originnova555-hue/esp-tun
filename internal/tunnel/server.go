@@ -149,11 +149,18 @@ type Server struct {
 	// a peer's live sessions.
 	revRR atomic.Uint64
 
-	// tunDev is non-nil when config.TUN.Enabled: one TUN device shared
-	// by every peer. Opened once in Start, closed once in Stop — never
+	// tunDevs is non-empty when config.TUN.Enabled: one TUN device per
+	// IFF_MULTI_QUEUE queue (config.TUN.Queues, default 1), shared by
+	// every peer. /dev/net/tun has no recvmmsg equivalent, so this is
+	// the batched-I/O answer for the server's TUN path — one
+	// tunReadLoop goroutine per queue, scaling packet processing
+	// across cores. Opened once in Start, closed once in Stop — never
 	// recreated per-session, so an individual peer's reconnect never
 	// disturbs it. See internal/tun's package doc for why.
-	tunDev *tun.Device
+	tunDevs []*tun.Device
+	// tunWriteIdx round-robins which queue handleTUNDatagram writes
+	// inbound packets to.
+	tunWriteIdx atomic.Uint32
 
 	// tunRouteV4 / tunRouteV6 map each peer's inner TUN address
 	// (peers[].tun_addr, parsed) to its peer name — the routing key
@@ -536,22 +543,28 @@ func (s *Server) Start() error {
 		go s.startReverseListener(rule)
 	}
 
-	// Layer-3 TUN mode: one shared device for every peer, opened once
-	// here and independent of any individual peer's session lifecycle
-	// — see the tunDev field doc comment.
+	// Layer-3 TUN mode: one shared device (per queue) for every peer,
+	// opened once here and independent of any individual peer's
+	// session lifecycle — see the tunDevs field doc comment.
 	if s.config.TUN.Enabled {
-		dev, err := tun.Open(tun.Config{
+		queues := s.config.TUN.Queues
+		if queues < 1 {
+			queues = 1
+		}
+		devs, err := tun.OpenQueues(tun.Config{
 			Name:    s.config.TUN.Name,
 			Local:   s.config.TUN.Local,
 			MTU:     s.config.TUN.MTU,
 			Persist: s.config.TUN.Persist,
-		})
+		}, queues)
 		if err != nil {
 			return fmt.Errorf("open tun device: %w", err)
 		}
-		s.tunDev = dev
-		slog.Info("tun device up", "component", "tun", "name", dev.Name(), "local", s.config.TUN.Local, "mtu", dev.MTU())
-		go s.tunReadLoop()
+		s.tunDevs = devs
+		slog.Info("tun device up", "component", "tun", "name", devs[0].Name(), "local", s.config.TUN.Local, "mtu", devs[0].MTU(), "queues", queues)
+		for _, dev := range devs {
+			go s.tunReadLoop(dev)
+		}
 	}
 
 	<-s.stopCh
@@ -1396,11 +1409,12 @@ func (s *Server) Stop() error {
 		s.listener.Close()
 	}
 
-	// Close the TUN device last, and only here — the top-level
-	// shutdown path. This unblocks tunReadLoop's pending Read; see
-	// the tunDev field doc comment for why nothing else may close it.
-	if s.tunDev != nil {
-		_ = s.tunDev.Close()
+	// Close the TUN queues last, and only here — the top-level
+	// shutdown path. This unblocks every tunReadLoop's pending Read;
+	// see the tunDevs field doc comment for why nothing else may
+	// close them.
+	for _, dev := range s.tunDevs {
+		_ = dev.Close()
 	}
 
 	return s.trans.Close()

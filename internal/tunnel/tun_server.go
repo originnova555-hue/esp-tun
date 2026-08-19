@@ -4,6 +4,8 @@ import (
 	"log/slog"
 
 	"github.com/quic-go/quic-go"
+
+	"github.com/pechenyeru/quiccochet/internal/tun"
 )
 
 // registerTUNSession adds a live session to the per-peer set tunReadLoop
@@ -66,23 +68,24 @@ func (s *Server) pickTUNSession(peer string, flowHash uint32) (*quic.Conn, bool)
 	return nil, false
 }
 
-// tunReadLoop reads whole IP packets off the shared TUN device and
-// routes each to the peer that owns its destination address (per
+// tunReadLoop reads whole IP packets off one TUN queue and routes
+// each to the peer that owns its destination address (per
 // peers[].tun_addr, resolved into s.tunRouteV4/V6 at NewServer time),
 // sending it as a type-prefixed QUIC datagram on one of that peer's
 // live sessions. A destination that matches no configured peer is
 // silently dropped — the TUN subnet has no "outside" route, unlike a
 // real router, because every address in it belongs to exactly one
-// peer by construction (config.Validate enforces disjointness).
-func (s *Server) tunReadLoop() {
+// peer by construction (config.Validate enforces disjointness). One
+// instance runs per queue in config.TUN.Queues (see Start).
+func (s *Server) tunReadLoop(dev *tun.Device) {
 	slog.Debug("tun read loop: start", "component", "tun")
 	defer slog.Debug("tun read loop: exit", "component", "tun")
 
-	mtu := s.tunDev.MTU()
+	mtu := dev.MTU()
 	buf := make([]byte, 1+mtu+64) // +64 headroom for any inner header irregularity
 
 	for s.running.Load() {
-		n, err := s.tunDev.Read(buf[1:])
+		n, err := dev.Read(buf[1:])
 		if err != nil {
 			if s.running.Load() {
 				slog.Debug("tun: read failed", "component", "tun", "error", err)
@@ -137,10 +140,11 @@ func (s *Server) tunPeerForDest(pkt []byte) (string, bool) {
 // handleTUNDatagram writes one inner IP packet received over QUIC
 // from peerName to the shared server TUN device.
 func (s *Server) handleTUNDatagram(pkt []byte, peerName string) {
-	if s.tunDev == nil || len(pkt) == 0 {
+	if len(s.tunDevs) == 0 || len(pkt) == 0 {
 		return
 	}
-	if _, err := s.tunDev.Write(pkt); err != nil {
+	dev := s.tunDevs[s.tunWriteIdx.Add(1)%uint32(len(s.tunDevs))]
+	if _, err := dev.Write(pkt); err != nil {
 		slog.Debug("tun: write failed", "component", "tun", "peer", peerName, "error", err)
 		return
 	}

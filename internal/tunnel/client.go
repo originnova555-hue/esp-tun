@@ -87,12 +87,21 @@ type Client struct {
 	tlsCert              *tls.Certificate
 	expectedPeerCertHash []byte
 
-	// tunDev is non-nil when config.TUN.Enabled. Its lifetime is
-	// intentionally independent of the QUIC connection pool: opened
-	// once in Start, closed once in Stop, never recreated by
-	// maintainPool's reconnect logic or a spoof-IP rotation — see
-	// internal/tun's package doc for why.
-	tunDev *tun.Device
+	// tunDevs is non-empty when config.TUN.Enabled — one entry per
+	// IFF_MULTI_QUEUE queue (config.TUN.Queues, default 1), each read
+	// by its own tunReadLoop goroutine. This is the batched-I/O answer
+	// for TUN: unlike a UDP socket, /dev/net/tun has no recvmmsg
+	// equivalent, so parallel queues are what lets packet processing
+	// scale across cores under load. Lifetime is intentionally
+	// independent of the QUIC connection pool: opened once in Start,
+	// closed once in Stop, never recreated by maintainPool's reconnect
+	// logic or a spoof-IP rotation — see internal/tun's package doc.
+	tunDevs []*tun.Device
+	// tunWriteIdx round-robins which queue handleTUNDatagram writes
+	// inbound replies to — writes are independent of which queue read
+	// the outbound packet, so any queue works; spreading them avoids
+	// piling all inbound traffic onto queue 0.
+	tunWriteIdx atomic.Uint32
 }
 
 type udpAssoc struct {
@@ -347,20 +356,26 @@ func (c *Client) Start() error {
 
 	// Layer-3 TUN mode: opened once here, independent of the QUIC pool
 	// lifecycle. maintainPool's reconnect logic and spoof-IP rotation
-	// must never touch tunDev — see the field doc comment.
+	// must never touch tunDevs — see the field doc comment.
 	if c.config.TUN.Enabled {
-		dev, err := tun.Open(tun.Config{
+		queues := c.config.TUN.Queues
+		if queues < 1 {
+			queues = 1
+		}
+		devs, err := tun.OpenQueues(tun.Config{
 			Name:    c.config.TUN.Name,
 			Local:   c.config.TUN.Local,
 			MTU:     c.config.TUN.MTU,
 			Persist: c.config.TUN.Persist,
-		})
+		}, queues)
 		if err != nil {
 			return fmt.Errorf("open tun device: %w", err)
 		}
-		c.tunDev = dev
-		slog.Info("tun device up", "component", "tun", "name", dev.Name(), "local", c.config.TUN.Local, "mtu", dev.MTU())
-		go c.tunReadLoop()
+		c.tunDevs = devs
+		slog.Info("tun device up", "component", "tun", "name", devs[0].Name(), "local", c.config.TUN.Local, "mtu", devs[0].MTU(), "queues", queues)
+		for _, dev := range devs {
+			go c.tunReadLoop(dev)
+		}
 	}
 
 	errCh := make(chan error, len(c.config.Inbounds))
@@ -953,10 +968,11 @@ func (c *Client) receiveDatagrams(sess *quic.Conn) {
 // advertised tun.enabled is either misconfigured or malicious either
 // way there is nothing useful to do with the packet.
 func (c *Client) handleTUNDatagram(pkt []byte) {
-	if c.tunDev == nil || len(pkt) == 0 {
+	if len(c.tunDevs) == 0 || len(pkt) == 0 {
 		return
 	}
-	if _, err := c.tunDev.Write(pkt); err != nil {
+	dev := c.tunDevs[c.tunWriteIdx.Add(1)%uint32(len(c.tunDevs))]
+	if _, err := dev.Write(pkt); err != nil {
 		slog.Debug("tun: write failed", "component", "tun", "error", err)
 		return
 	}
@@ -996,20 +1012,21 @@ func (c *Client) handleUDPRelayDatagram(msg []byte) {
 	putReply()
 }
 
-// tunReadLoop reads whole IP packets off the local TUN device and
-// sends each as a type-prefixed QUIC datagram on a pool connection
-// chosen by the inner flow's hash — see tunFlowHash for why this
-// matters for ordering. Runs until the TUN device is closed (Stop) or
-// the client stops running.
-func (c *Client) tunReadLoop() {
+// tunReadLoop reads whole IP packets off one TUN queue and sends
+// each as a type-prefixed QUIC datagram on a pool connection chosen
+// by the inner flow's hash — see tunFlowHash for why this matters
+// for ordering. One instance runs per queue in config.TUN.Queues
+// (see Start), so this is safe to run concurrently across queues.
+// Runs until dev is closed (Stop) or the client stops running.
+func (c *Client) tunReadLoop(dev *tun.Device) {
 	slog.Debug("tun read loop: start", "component", "tun")
 	defer slog.Debug("tun read loop: exit", "component", "tun")
 
-	mtu := c.tunDev.MTU()
+	mtu := dev.MTU()
 	buf := make([]byte, 1+mtu+64) // +64 headroom for any inner header irregularity
 
 	for c.running.Load() {
-		n, err := c.tunDev.Read(buf[1:])
+		n, err := dev.Read(buf[1:])
 		if err != nil {
 			if c.running.Load() {
 				slog.Debug("tun: read failed", "component", "tun", "error", err)
@@ -1189,11 +1206,12 @@ func (c *Client) Stop() error {
 		c.socksServer.Close()
 	}
 
-	// Close the TUN device last, and only here — the top-level
-	// shutdown path. This unblocks tunReadLoop's pending Read; see
-	// the tunDev field doc comment for why nothing else may close it.
-	if c.tunDev != nil {
-		_ = c.tunDev.Close()
+	// Close the TUN queues last, and only here — the top-level
+	// shutdown path. This unblocks every tunReadLoop's pending Read;
+	// see the tunDevs field doc comment for why nothing else may
+	// close them.
+	for _, dev := range c.tunDevs {
+		_ = dev.Close()
 	}
 
 	return c.trans.Close()

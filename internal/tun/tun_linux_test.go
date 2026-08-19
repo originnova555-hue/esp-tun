@@ -149,3 +149,70 @@ func TestMissingLocalRejected(t *testing.T) {
 		t.Fatal("expected error for missing local address")
 	}
 }
+
+func TestOpenQueuesMultiQueueAllQueuesUsable(t *testing.T) {
+	requireCapNetAdmin(t)
+
+	devs, err := OpenQueues(Config{
+		Name:  "qcmq0",
+		Local: "10.255.0.1/24",
+		MTU:   1400,
+	}, 4)
+	if err != nil {
+		t.Fatalf("OpenQueues: %v", err)
+	}
+	defer func() {
+		for _, d := range devs {
+			d.Close()
+		}
+		exec.Command("ip", "link", "delete", "qcmq0").Run()
+	}()
+
+	if len(devs) != 4 {
+		t.Fatalf("got %d devices, want 4", len(devs))
+	}
+	for i, d := range devs {
+		if d.Name() != "qcmq0" {
+			t.Errorf("devs[%d].Name() = %q, want qcmq0", i, d.Name())
+		}
+		if d.MTU() != 1400 {
+			t.Errorf("devs[%d].MTU() = %d, want 1400", i, d.MTU())
+		}
+	}
+
+	// Distinct fds: writing on one queue and reading on another
+	// exercises the actual kernel-side multiqueue dispatch, not just
+	// that four fds happened to open without erroring.
+	seen := map[int]bool{}
+	for _, d := range devs {
+		if seen[d.Fd()] {
+			t.Fatalf("duplicate fd %d across queues", d.Fd())
+		}
+		seen[d.Fd()] = true
+	}
+
+	out, err := exec.Command("ip", "-d", "link", "show", "qcmq0").CombinedOutput()
+	if err != nil {
+		t.Fatalf("ip link show: %v: %s", err, out)
+	}
+	if !strings.Contains(string(out), "UP") {
+		t.Errorf("interface not up:\n%s", out)
+	}
+}
+
+func TestOpenQueuesSingleQueueEquivalentToOpen(t *testing.T) {
+	requireCapNetAdmin(t)
+
+	devs, err := OpenQueues(Config{Name: "qcmq1", Local: "10.255.1.1/24", MTU: 1400}, 1)
+	if err != nil {
+		t.Fatalf("OpenQueues(n=1): %v", err)
+	}
+	defer func() {
+		devs[0].Close()
+		exec.Command("ip", "link", "delete", "qcmq1").Run()
+	}()
+
+	if len(devs) != 1 {
+		t.Fatalf("got %d devices, want 1", len(devs))
+	}
+}

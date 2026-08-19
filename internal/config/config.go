@@ -491,6 +491,16 @@ type TUNConfig struct {
 	// e.g. under systemd Restart=always. The manager script is
 	// expected to tear it down explicitly on tunnel removal.
 	Persist bool `json:"persist"`
+
+	// Queues sets the number of IFF_MULTI_QUEUE TUN queues to open,
+	// each read/written by its own goroutine. /dev/net/tun has no
+	// recvmmsg/sendmmsg equivalent (one fd transfers one packet per
+	// syscall), so this is the batched-I/O answer for TUN: N queues
+	// let N goroutines pull from the kernel in parallel instead of
+	// serializing through one fd. 0 or 1 = a single queue (default,
+	// safe for Light/Medium tiers); higher tiers set this to the core
+	// count. See internal/tun.OpenQueues.
+	Queues int `json:"queues,omitempty"`
 }
 
 // AdminConfig configures the admin Unix socket used for on-demand
@@ -1235,6 +1245,9 @@ func (c *Config) validateTUN() []string {
 
 	if c.TUN.MTU != 0 && (c.TUN.MTU < 576 || c.TUN.MTU > 9000) {
 		errs = append(errs, fmt.Sprintf("tun.mtu=%d is out of range (576..9000)", c.TUN.MTU))
+	}
+	if c.TUN.Queues < 0 || c.TUN.Queues > 256 {
+		errs = append(errs, fmt.Sprintf("tun.queues=%d is out of range (0=default 1, 1..256 explicit)", c.TUN.Queues))
 	}
 	// The inner IP packet plus its 1-byte datagram-type prefix (see
 	// internal/tunnel/datagram.go) must fit inside what the transport
