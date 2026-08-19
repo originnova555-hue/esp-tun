@@ -64,6 +64,11 @@ reconnect_max_ms      = 60000
 # "auto" picks AES-256-GCM when the CPU has AES-NI, ChaCha20-Poly1305
 # otherwise. Run "quiccochet cpuinfo" to see what this box will choose.
 cipher = "auto"
+# What the handshake claims to be talking to. Nothing verifies it — its
+# only job is to look ordinary to whatever is watching the connection.
+sni    = "www.cloudflare.com"
+alpn   = ["h3"]
+
 # Same value on both sides. Generate one with: quiccochet genpsk
 psk    = "CHANGE-ME-both-sides-must-match"
 

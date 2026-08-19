@@ -1,6 +1,10 @@
 package config
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/originnova555-hue/esp-tun/internal/crypto"
+)
 
 // Performance tiers. A tier is only a set of defaults over the ordinary config
 // surface — there is no tier-specific code path anywhere in the engine.
@@ -45,7 +49,7 @@ func base() *Config {
 			ReconnectMinMs:      500,
 			ReconnectMaxMs:      30000,
 		},
-		Crypto: Crypto{Cipher: "auto"},
+		Crypto: Crypto{Cipher: "auto", SNI: crypto.DefaultSNI, ALPN: []string{crypto.DefaultALPN}},
 		Datapath: Datapath{
 			Coalesce:   true,
 			CoalesceUS: 100,

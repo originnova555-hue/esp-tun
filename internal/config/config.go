@@ -101,8 +101,10 @@ type QUIC struct {
 
 // Crypto selects the AEAD and carries the pre-shared key that replaces a PKI.
 type Crypto struct {
-	Cipher string `toml:"cipher"` // auto | aes-256-gcm | chacha20-poly1305
-	PSK    string `toml:"psk"`
+	Cipher string   `toml:"cipher"` // auto | aes-256-gcm | chacha20-poly1305
+	PSK    string   `toml:"psk"`
+	SNI    string   `toml:"sni"`  // server name the client asks for; nothing verifies it
+	ALPN   []string `toml:"alpn"` // application protocol advertised in the handshake
 }
 
 // Obfs is the tiered traffic-shaping layer. Padding happens inside the QUIC
