@@ -22,6 +22,7 @@ import (
 	"github.com/pechenyeru/quiccochet/internal/crypto"
 	"github.com/pechenyeru/quiccochet/internal/socks"
 	"github.com/pechenyeru/quiccochet/internal/transport"
+	"github.com/pechenyeru/quiccochet/internal/tun"
 )
 
 const (
@@ -85,6 +86,13 @@ type Client struct {
 	// share the same X25519 secret.
 	tlsCert              *tls.Certificate
 	expectedPeerCertHash []byte
+
+	// tunDev is non-nil when config.TUN.Enabled. Its lifetime is
+	// intentionally independent of the QUIC connection pool: opened
+	// once in Start, closed once in Stop, never recreated by
+	// maintainPool's reconnect logic or a spoof-IP rotation — see
+	// internal/tun's package doc for why.
+	tunDev *tun.Device
 }
 
 type udpAssoc struct {
@@ -336,6 +344,24 @@ func (c *Client) Start() error {
 
 	// Periodic stats for diagnostics
 	go c.statsTicker()
+
+	// Layer-3 TUN mode: opened once here, independent of the QUIC pool
+	// lifecycle. maintainPool's reconnect logic and spoof-IP rotation
+	// must never touch tunDev — see the field doc comment.
+	if c.config.TUN.Enabled {
+		dev, err := tun.Open(tun.Config{
+			Name:    c.config.TUN.Name,
+			Local:   c.config.TUN.Local,
+			MTU:     c.config.TUN.MTU,
+			Persist: c.config.TUN.Persist,
+		})
+		if err != nil {
+			return fmt.Errorf("open tun device: %w", err)
+		}
+		c.tunDev = dev
+		slog.Info("tun device up", "component", "tun", "name", dev.Name(), "local", c.config.TUN.Local, "mtu", dev.MTU())
+		go c.tunReadLoop()
+	}
 
 	errCh := make(chan error, len(c.config.Inbounds))
 	for _, inb := range c.config.Inbounds {
@@ -844,11 +870,12 @@ func (c *Client) handleUDP(tcpConn net.Conn, udpConn *net.UDPConn) error {
 		// Skip RSV(2) + FRAG(1), keep ATYP+ADDR+PORT+DATA
 		addrAndData := buf[3:n]
 
-		// Build QUIC datagram: [AssocID:4][ATYP+ADDR+PORT+DATA]
-		pktSize := 4 + len(addrAndData)
+		// Build QUIC datagram: [Type:1][AssocID:4][ATYP+ADDR+PORT+DATA]
+		pktSize := 1 + 4 + len(addrAndData)
 		pkt, putPkt := getDatagramBuf(pktSize)
-		binary.BigEndian.PutUint32(pkt[0:4], assocID)
-		copy(pkt[4:], addrAndData)
+		pkt[0] = datagramTypeUDPRelay
+		binary.BigEndian.PutUint32(pkt[1:5], assocID)
+		copy(pkt[5:], addrAndData)
 
 		// Pin this assoc to a single pool connection. Round-robin per
 		// datagram would land each packet on a different QUIC session,
@@ -893,6 +920,11 @@ func (c *Client) handleUDP(tcpConn net.Conn, udpConn *net.UDPConn) error {
 }
 
 // receiveDatagrams handles UDP replies from the server via QUIC datagrams.
+// receiveDatagrams demultiplexes incoming QUIC datagrams on sess by
+// their leading type byte: TUN packets go straight to the TUN device,
+// legacy SOCKS5 UDP-relay datagrams go through the existing
+// assoc-lookup path. One goroutine per pool connection, matching the
+// existing per-connection receive-loop pattern.
 func (c *Client) receiveDatagrams(sess *quic.Conn) {
 	slog.Debug("datagram receiver: start", "component", "quic")
 	defer slog.Debug("datagram receiver: exit", "component", "quic")
@@ -902,33 +934,126 @@ func (c *Client) receiveDatagrams(sess *quic.Conn) {
 			slog.Debug("datagram receiver: receive error", "component", "quic", "error", err)
 			return
 		}
-		if len(msg) < 7 {
+		if len(msg) < 1 {
 			continue
 		}
 
-		assocID := binary.BigEndian.Uint32(msg[0:4])
-		val, ok := c.udpAssociations.Load(assocID)
-		if !ok {
+		switch msg[0] {
+		case datagramTypeTUN:
+			c.handleTUNDatagram(msg[1:])
+		case datagramTypeUDPRelay:
+			c.handleUDPRelayDatagram(msg[1:])
+		}
+	}
+}
+
+// handleTUNDatagram writes one inner IP packet received over QUIC to
+// the local TUN device. No-op (drops the packet) if TUN mode isn't
+// enabled — a peer sending TUN datagrams to a client that never
+// advertised tun.enabled is either misconfigured or malicious either
+// way there is nothing useful to do with the packet.
+func (c *Client) handleTUNDatagram(pkt []byte) {
+	if c.tunDev == nil || len(pkt) == 0 {
+		return
+	}
+	if _, err := c.tunDev.Write(pkt); err != nil {
+		slog.Debug("tun: write failed", "component", "tun", "error", err)
+		return
+	}
+	c.bytesReceived.Add(uint64(len(pkt)))
+}
+
+// handleUDPRelayDatagram is the pre-refactor SOCKS5 UDP-ASSOCIATE
+// relay receive path, unchanged except for consuming msg with the
+// leading type byte already stripped by the caller.
+func (c *Client) handleUDPRelayDatagram(msg []byte) {
+	if len(msg) < 6 {
+		return
+	}
+
+	assocID := binary.BigEndian.Uint32(msg[0:4])
+	val, ok := c.udpAssociations.Load(assocID)
+	if !ok {
+		return
+	}
+
+	assoc := val.(*udpAssoc)
+	clientAddr := assoc.clientAddr.Load()
+	if clientAddr == nil {
+		return
+	}
+
+	// Rebuild SOCKS5 UDP response: [RSV:0,0][FRAG:0][ATYP+ADDR+PORT+DATA]
+	addrAndData := msg[4:]
+	reply, putReply := getDatagramBuf(3 + len(addrAndData))
+	reply[0] = 0 // RSV
+	reply[1] = 0
+	reply[2] = 0 // FRAG
+	copy(reply[3:], addrAndData)
+
+	_, _ = assoc.conn.WriteToUDP(reply, clientAddr)
+	c.bytesReceived.Add(uint64(len(addrAndData)))
+	putReply()
+}
+
+// tunReadLoop reads whole IP packets off the local TUN device and
+// sends each as a type-prefixed QUIC datagram on a pool connection
+// chosen by the inner flow's hash — see tunFlowHash for why this
+// matters for ordering. Runs until the TUN device is closed (Stop) or
+// the client stops running.
+func (c *Client) tunReadLoop() {
+	slog.Debug("tun read loop: start", "component", "tun")
+	defer slog.Debug("tun read loop: exit", "component", "tun")
+
+	mtu := c.tunDev.MTU()
+	buf := make([]byte, 1+mtu+64) // +64 headroom for any inner header irregularity
+
+	for c.running.Load() {
+		n, err := c.tunDev.Read(buf[1:])
+		if err != nil {
+			if c.running.Load() {
+				slog.Debug("tun: read failed", "component", "tun", "error", err)
+			}
+			return
+		}
+		if n == 0 {
 			continue
 		}
+		buf[0] = datagramTypeTUN
+		pkt := buf[:1+n]
 
-		assoc := val.(*udpAssoc)
-		clientAddr := assoc.clientAddr.Load()
-		if clientAddr == nil {
+		flowHash := tunFlowHash(pkt[1:])
+
+		c.mu.RLock()
+		poolN := uint32(len(c.conns))
+		if poolN == 0 {
+			c.mu.RUnlock()
 			continue
 		}
+		idx := flowHash % poolN
+		sess := c.conns[idx]
+		if sess == nil || sess.Context().Err() != nil {
+			for i := range poolN {
+				alt := c.conns[(idx+i)%poolN]
+				if alt != nil && alt.Context().Err() == nil {
+					sess = alt
+					break
+				}
+			}
+		}
+		var sendErr error
+		if sess != nil && sess.Context().Err() == nil {
+			sendErr = sess.SendDatagram(pkt)
+		}
+		c.mu.RUnlock()
 
-		// Rebuild SOCKS5 UDP response: [RSV:0,0][FRAG:0][ATYP+ADDR+PORT+DATA]
-		addrAndData := msg[4:]
-		reply, putReply := getDatagramBuf(3 + len(addrAndData))
-		reply[0] = 0 // RSV
-		reply[1] = 0
-		reply[2] = 0 // FRAG
-		copy(reply[3:], addrAndData)
-
-		_, _ = assoc.conn.WriteToUDP(reply, clientAddr)
-		c.bytesReceived.Add(uint64(len(addrAndData)))
-		putReply()
+		if sendErr != nil {
+			slog.Debug("tun: datagram send failed", "component", "tun", "size", n, "error", sendErr)
+			continue
+		}
+		if sess != nil {
+			c.bytesSent.Add(uint64(n))
+		}
 	}
 }
 
@@ -1063,6 +1188,14 @@ func (c *Client) Stop() error {
 	if c.socksServer != nil {
 		c.socksServer.Close()
 	}
+
+	// Close the TUN device last, and only here — the top-level
+	// shutdown path. This unblocks tunReadLoop's pending Read; see
+	// the tunDev field doc comment for why nothing else may close it.
+	if c.tunDev != nil {
+		_ = c.tunDev.Close()
+	}
+
 	return c.trans.Close()
 }
 

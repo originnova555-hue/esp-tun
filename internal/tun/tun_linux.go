@@ -24,10 +24,10 @@ const (
 	ifnameSize = unix.IFNAMSIZ
 
 	// From linux/if_tun.h — not exposed by golang.org/x/sys/unix.
-	tunSetIff   = 0x400454ca
+	tunSetIff     = 0x400454ca
 	tunSetPersist = 0x400454cb
-	iffTun      = 0x0001
-	iffNoPI     = 0x1000
+	iffTun        = 0x0001
+	iffNoPI       = 0x1000
 )
 
 type ifReq struct {

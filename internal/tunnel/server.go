@@ -29,6 +29,7 @@ import (
 	"github.com/pechenyeru/quiccochet/internal/crypto"
 	"github.com/pechenyeru/quiccochet/internal/socks"
 	"github.com/pechenyeru/quiccochet/internal/transport"
+	"github.com/pechenyeru/quiccochet/internal/tun"
 	"golang.org/x/net/proxy"
 )
 
@@ -147,6 +148,30 @@ type Server struct {
 	// revRR is the round-robin cursor pickReverseSession advances across
 	// a peer's live sessions.
 	revRR atomic.Uint64
+
+	// tunDev is non-nil when config.TUN.Enabled: one TUN device shared
+	// by every peer. Opened once in Start, closed once in Stop — never
+	// recreated per-session, so an individual peer's reconnect never
+	// disturbs it. See internal/tun's package doc for why.
+	tunDev *tun.Device
+
+	// tunRouteV4 / tunRouteV6 map each peer's inner TUN address
+	// (peers[].tun_addr, parsed) to its peer name — the routing key
+	// tunReadLoop uses to decide which peer's session a packet read
+	// off the shared TUN device belongs to. Built once in NewServer
+	// from static config; read-only thereafter, like peerCiphers.
+	tunRouteV4 map[[4]byte]string
+	tunRouteV6 map[[16]byte]string
+
+	// tunPeerSessions tracks the live QUIC sessions for each peer name
+	// so tunReadLoop has something to send on — a client's pool_size
+	// dial fans out to that many independent sessions on the server,
+	// unlike the single clientRoute a client-mode Server never has.
+	// Mirrors revSessions's shape/locking; kept separate because TUN
+	// routing is unconditional (always populated when tun.enabled)
+	// while revSessions is opt-in behind reverse_forwards.
+	tunPeerSessions map[string]map[*quic.Conn]struct{}
+	tunPeerMu       sync.Mutex
 }
 
 // peerCounters holds the per-peer subset of the same atomic counters
@@ -368,20 +393,47 @@ func NewServer(cfg *config.Config, serverKeyPair *crypto.KeyPair, peerHashes map
 
 	verifyFn := crypto.MakeVerifyPeerCertificateMulti(peerHashes)
 
+	// TUN routing table: peers[].tun_addr -> peer name. Config.Validate
+	// already enforces well-formedness/subnet-membership/disjointness
+	// when tun.enabled=true; parse failures here are skipped rather
+	// than fatal so NewServer stays usable in tests that build a
+	// Config by hand without going through Validate.
+	tunRouteV4 := make(map[[4]byte]string)
+	tunRouteV6 := make(map[[16]byte]string)
+	if cfg.TUN.Enabled {
+		for _, p := range cfg.Peers {
+			if p.TUNAddr == "" {
+				continue
+			}
+			addr, err := netip.ParseAddr(p.TUNAddr)
+			if err != nil {
+				continue
+			}
+			if addr.Is4() {
+				tunRouteV4[addr.As4()] = p.Name
+			} else {
+				tunRouteV6[addr.As16()] = p.Name
+			}
+		}
+	}
+
 	s := &Server{
-		config:         cfg,
-		trans:          trans,
-		stopCh:         make(chan struct{}),
-		startedAt:      time.Now(),
-		pprof:          admin.NewPprofServer(),
-		peerCerts:      peerCerts,
-		fallbackCert:   fallbackCert,
-		verifyPeerCert: verifyFn,
-		peerCiphers:    peerCiphers,
-		spoofToRoute:   spoofToRoute,
-		peerByAddr:     peerByAddr,
-		peerCounters:   peerCountersMap,
-		peerOrder:      peerOrder,
+		config:          cfg,
+		trans:           trans,
+		stopCh:          make(chan struct{}),
+		startedAt:       time.Now(),
+		pprof:           admin.NewPprofServer(),
+		peerCerts:       peerCerts,
+		fallbackCert:    fallbackCert,
+		verifyPeerCert:  verifyFn,
+		peerCiphers:     peerCiphers,
+		spoofToRoute:    spoofToRoute,
+		peerByAddr:      peerByAddr,
+		peerCounters:    peerCountersMap,
+		peerOrder:       peerOrder,
+		tunRouteV4:      tunRouteV4,
+		tunRouteV6:      tunRouteV6,
+		tunPeerSessions: make(map[string]map[*quic.Conn]struct{}),
 	}
 
 	if cfg.OutboundProxy.Enabled {
@@ -484,6 +536,24 @@ func (s *Server) Start() error {
 		go s.startReverseListener(rule)
 	}
 
+	// Layer-3 TUN mode: one shared device for every peer, opened once
+	// here and independent of any individual peer's session lifecycle
+	// — see the tunDev field doc comment.
+	if s.config.TUN.Enabled {
+		dev, err := tun.Open(tun.Config{
+			Name:    s.config.TUN.Name,
+			Local:   s.config.TUN.Local,
+			MTU:     s.config.TUN.MTU,
+			Persist: s.config.TUN.Persist,
+		})
+		if err != nil {
+			return fmt.Errorf("open tun device: %w", err)
+		}
+		s.tunDev = dev
+		slog.Info("tun device up", "component", "tun", "name", dev.Name(), "local", s.config.TUN.Local, "mtu", dev.MTU())
+		go s.tunReadLoop()
+	}
+
 	<-s.stopCh
 	return nil
 }
@@ -549,6 +619,16 @@ func (s *Server) handleSession(sess *quic.Conn) {
 	if len(s.config.ReverseForwards) > 0 && peerName != "" {
 		s.registerReverseSession(peerName, sess)
 		defer s.unregisterReverseSession(peerName, sess)
+	}
+
+	// Register this session as a TUN send target for its peer. A
+	// client's QUIC pool (pool_size dials) fans out to that many
+	// independent sessions here; tunReadLoop picks one by inner-flow
+	// hash when routing a packet read off the shared TUN device to
+	// this peer.
+	if s.config.TUN.Enabled && peerName != "" {
+		s.registerTUNSession(peerName, sess)
+		defer s.unregisterTUNSession(peerName, sess)
 	}
 
 	go s.handleDatagrams(sess, peerName)
@@ -661,6 +741,24 @@ func (s *Server) handleDatagrams(sess *quic.Conn, peerName string) {
 			slog.Debug("datagrams: receive error", "component", "udp", "remote", remote, "error", err)
 			return
 		}
+		if len(msg) < 1 {
+			continue
+		}
+
+		datagramType := msg[0]
+		msg = msg[1:]
+
+		if datagramType == datagramTypeTUN {
+			s.handleTUNDatagram(msg, peerName)
+			continue
+		}
+		if datagramType != datagramTypeUDPRelay {
+			continue
+		}
+
+		// Same minimum this loop enforced pre-refactor (AssocID:4 +
+		// at least a 3-byte ATYP+ADDR+PORT prefix), now measured
+		// against msg with the leading type byte already stripped.
 		if len(msg) < 7 {
 			continue
 		}
@@ -1001,10 +1099,11 @@ func (s *Server) receiveDirectDatagrams(sess *quic.Conn, route *datagramRoute, c
 			srcIP = v4
 		}
 		addrBytes := socks.BuildAddress(srcIP.String(), uint16(srcAddr.Port))
-		reply, putReply := getDatagramBuf(4 + len(addrBytes) + n)
-		copy(reply[0:4], assocIDBytes)
-		copy(reply[4:], addrBytes)
-		copy(reply[4+len(addrBytes):], buf[:n])
+		reply, putReply := getDatagramBuf(1 + 4 + len(addrBytes) + n)
+		reply[0] = datagramTypeUDPRelay
+		copy(reply[1:5], assocIDBytes)
+		copy(reply[5:], addrBytes)
+		copy(reply[5+len(addrBytes):], buf[:n])
 
 		_ = sess.SendDatagram(reply)
 		s.bytesSent.Add(uint64(n))
@@ -1082,10 +1181,11 @@ func (s *Server) receiveProxyDatagrams(sess *quic.Conn, route *datagramRoute, pr
 		}
 
 		addrBytes := socks.BuildAddress(srcHost, srcPort)
-		reply, putReply := getDatagramBuf(4 + len(addrBytes) + n)
-		copy(reply[0:4], assocIDBytes)
-		copy(reply[4:], addrBytes)
-		copy(reply[4+len(addrBytes):], buf[:n])
+		reply, putReply := getDatagramBuf(1 + 4 + len(addrBytes) + n)
+		reply[0] = datagramTypeUDPRelay
+		copy(reply[1:5], assocIDBytes)
+		copy(reply[5:], addrBytes)
+		copy(reply[5+len(addrBytes):], buf[:n])
 
 		_ = sess.SendDatagram(reply)
 		s.bytesSent.Add(uint64(n))
@@ -1295,6 +1395,14 @@ func (s *Server) Stop() error {
 	if s.listener != nil {
 		s.listener.Close()
 	}
+
+	// Close the TUN device last, and only here — the top-level
+	// shutdown path. This unblocks tunReadLoop's pending Read; see
+	// the tunDev field doc comment for why nothing else may close it.
+	if s.tunDev != nil {
+		_ = s.tunDev.Close()
+	}
+
 	return s.trans.Close()
 }
 
