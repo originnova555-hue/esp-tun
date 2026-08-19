@@ -501,6 +501,16 @@ type TUNConfig struct {
 	// safe for Light/Medium tiers); higher tiers set this to the core
 	// count. See internal/tun.OpenQueues.
 	Queues int `json:"queues,omitempty"`
+
+	// PinCores, when true, locks each TUN queue's read/write goroutine
+	// to its own CPU core (queue i -> core i, wrapping if Queues
+	// exceeds the core count) via internal/affinity. Improves cache
+	// locality and avoids the Go scheduler shuffling hot packet-
+	// processing goroutines between cores under load — the effect
+	// only shows up with Queues > 1 and enough real traffic to keep
+	// multiple cores busy, so it's off by default and left to the
+	// higher tiers (High/Ultra) to enable.
+	PinCores bool `json:"pin_cores,omitempty"`
 }
 
 // AdminConfig configures the admin Unix socket used for on-demand

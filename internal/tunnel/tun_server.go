@@ -5,6 +5,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 
+	"github.com/pechenyeru/quiccochet/internal/affinity"
 	"github.com/pechenyeru/quiccochet/internal/tun"
 )
 
@@ -77,7 +78,19 @@ func (s *Server) pickTUNSession(peer string, flowHash uint32) (*quic.Conn, bool)
 // real router, because every address in it belongs to exactly one
 // peer by construction (config.Validate enforces disjointness). One
 // instance runs per queue in config.TUN.Queues (see Start).
-func (s *Server) tunReadLoop(dev *tun.Device) {
+//
+// core >= 0 pins this goroutine's OS thread to that CPU core for the
+// goroutine's entire lifetime (config.TUN.PinCores); core < 0 skips
+// pinning entirely.
+func (s *Server) tunReadLoop(dev *tun.Device, core int) {
+	if core >= 0 {
+		if err := affinity.PinCurrentGoroutine(core); err != nil {
+			slog.Warn("tun: core pinning failed, continuing unpinned", "component", "tun", "core", core, "error", err)
+		} else {
+			slog.Debug("tun read loop: pinned", "component", "tun", "core", core)
+		}
+	}
+
 	slog.Debug("tun read loop: start", "component", "tun")
 	defer slog.Debug("tun read loop: exit", "component", "tun")
 

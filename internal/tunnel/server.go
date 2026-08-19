@@ -25,6 +25,7 @@ import (
 	"github.com/quic-go/quic-go/qlog"
 
 	"github.com/pechenyeru/quiccochet/internal/admin"
+	"github.com/pechenyeru/quiccochet/internal/affinity"
 	"github.com/pechenyeru/quiccochet/internal/config"
 	"github.com/pechenyeru/quiccochet/internal/crypto"
 	"github.com/pechenyeru/quiccochet/internal/socks"
@@ -562,8 +563,12 @@ func (s *Server) Start() error {
 		}
 		s.tunDevs = devs
 		slog.Info("tun device up", "component", "tun", "name", devs[0].Name(), "local", s.config.TUN.Local, "mtu", devs[0].MTU(), "queues", queues)
-		for _, dev := range devs {
-			go s.tunReadLoop(dev)
+		for i, dev := range devs {
+			core := -1
+			if s.config.TUN.PinCores {
+				core = i % affinity.NumCPU()
+			}
+			go s.tunReadLoop(dev, core)
 		}
 	}
 

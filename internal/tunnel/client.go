@@ -18,6 +18,7 @@ import (
 	"github.com/quic-go/quic-go/qlog"
 
 	"github.com/pechenyeru/quiccochet/internal/admin"
+	"github.com/pechenyeru/quiccochet/internal/affinity"
 	"github.com/pechenyeru/quiccochet/internal/config"
 	"github.com/pechenyeru/quiccochet/internal/crypto"
 	"github.com/pechenyeru/quiccochet/internal/socks"
@@ -373,8 +374,12 @@ func (c *Client) Start() error {
 		}
 		c.tunDevs = devs
 		slog.Info("tun device up", "component", "tun", "name", devs[0].Name(), "local", c.config.TUN.Local, "mtu", devs[0].MTU(), "queues", queues)
-		for _, dev := range devs {
-			go c.tunReadLoop(dev)
+		for i, dev := range devs {
+			core := -1
+			if c.config.TUN.PinCores {
+				core = i % affinity.NumCPU()
+			}
+			go c.tunReadLoop(dev, core)
 		}
 	}
 
@@ -1018,7 +1023,19 @@ func (c *Client) handleUDPRelayDatagram(msg []byte) {
 // for ordering. One instance runs per queue in config.TUN.Queues
 // (see Start), so this is safe to run concurrently across queues.
 // Runs until dev is closed (Stop) or the client stops running.
-func (c *Client) tunReadLoop(dev *tun.Device) {
+//
+// core >= 0 pins this goroutine's OS thread to that CPU core for the
+// goroutine's entire lifetime (config.TUN.PinCores); core < 0 skips
+// pinning entirely.
+func (c *Client) tunReadLoop(dev *tun.Device, core int) {
+	if core >= 0 {
+		if err := affinity.PinCurrentGoroutine(core); err != nil {
+			slog.Warn("tun: core pinning failed, continuing unpinned", "component", "tun", "core", core, "error", err)
+		} else {
+			slog.Debug("tun read loop: pinned", "component", "tun", "core", core)
+		}
+	}
+
 	slog.Debug("tun read loop: start", "component", "tun")
 	defer slog.Debug("tun read loop: exit", "component", "tun")
 
