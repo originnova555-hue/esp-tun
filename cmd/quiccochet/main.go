@@ -61,6 +61,7 @@ var mainCmd = &cobra.Command{
 		fmt.Printf("%-30s %s\n", "Mode:", cfg.Mode)
 		fmt.Printf("%-30s %s\n", "Transport:", cfg.Transport.Type)
 		fmt.Printf("%-30s %s\n", "Local public key:", keyPair.PublicKeyBase64())
+		fmt.Printf("%-30s %s\n", "Obfuscation-layer AEAD:", crypto.AEADName)
 		if cfg.Transport.Type == config.TransportICMP {
 			fmt.Printf("%-30s %s\n", "ICMP Mode:", blue(cfg.Transport.ICMPMode))
 		}

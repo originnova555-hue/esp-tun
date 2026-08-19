@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
@@ -10,6 +11,7 @@ import (
 	"sync/atomic"
 
 	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/sys/cpu"
 )
 
 const (
@@ -30,7 +32,54 @@ var (
 
 const replayWindowSize = 2048
 
-// Cipher handles ChaCha20-Poly1305 encryption/decryption
+// AEADName reports which AEAD selectAEAD picked on this CPU: "aes-256-gcm"
+// when hardware AES acceleration was detected, "chacha20-poly1305"
+// otherwise. Computed once at package init since CPU features don't
+// change at runtime; logged at startup (see cmd/quiccochet/main.go)
+// so operators can see what an obfuscation.mode != "none" deployment
+// will actually run.
+var AEADName = func() string {
+	if hasAESHardware() {
+		return "aes-256-gcm"
+	}
+	return "chacha20-poly1305"
+}()
+
+// hasAESHardware reports whether this CPU has hardware AES
+// acceleration (AES-NI on x86, the ARMv8 Cryptography Extensions on
+// arm64). Software AES-GCM is constant-time-unsafe and slower than
+// ChaCha20-Poly1305, so selectAEAD only picks AES when the hardware
+// path is actually available — mirrors the same auto-selection Go's
+// crypto/tls already does for the QUIC/TLS handshake's cipher suite
+// (this package's AEAD is the separate obfuscation-layer cipher used
+// when obfuscation.mode != "none"; TLS's own negotiation is unaffected
+// by this and not duplicated here).
+func hasAESHardware() bool {
+	return cpu.X86.HasAES || cpu.ARM64.HasAES
+}
+
+// selectAEAD builds the AEAD for key: AES-256-GCM when hardware AES
+// acceleration is available, ChaCha20-Poly1305 otherwise. Both use a
+// 12-byte nonce and 16-byte tag (NonceSize/TagSize), so callers never
+// need to branch on which one was picked.
+func selectAEAD(key []byte) (cipher.AEAD, error) {
+	if hasAESHardware() {
+		block, err := aes.NewCipher(key)
+		if err != nil {
+			return nil, fmt.Errorf("create aes cipher: %w", err)
+		}
+		aead, err := cipher.NewGCM(block)
+		if err != nil {
+			return nil, fmt.Errorf("create gcm aead: %w", err)
+		}
+		return aead, nil
+	}
+	return chacha20poly1305.New(key)
+}
+
+// Cipher handles AEAD encryption/decryption. The concrete algorithm
+// (AES-256-GCM or ChaCha20-Poly1305) is chosen once per process by
+// selectAEAD based on CPU capability — see AEADName.
 type Cipher struct {
 	sendAEAD cipher.AEAD
 	recvAEAD cipher.AEAD
@@ -61,12 +110,12 @@ type Cipher struct {
 // packet with a different prefix is rejected, since the Cipher lifecycle
 // is bound to a single QUIC session.
 func NewCipher(sendKey, recvKey [KeySize]byte) (*Cipher, error) {
-	sendAEAD, err := chacha20poly1305.New(sendKey[:])
+	sendAEAD, err := selectAEAD(sendKey[:])
 	if err != nil {
 		return nil, fmt.Errorf("create send cipher: %w", err)
 	}
 
-	recvAEAD, err := chacha20poly1305.New(recvKey[:])
+	recvAEAD, err := selectAEAD(recvKey[:])
 	if err != nil {
 		return nil, fmt.Errorf("create recv cipher: %w", err)
 	}

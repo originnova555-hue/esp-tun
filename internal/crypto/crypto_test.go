@@ -2,6 +2,7 @@ package crypto
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
 	"testing"
@@ -317,4 +318,57 @@ func FuzzCipherDecrypt(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		_, _ = c.DecryptTo(dst, data)
 	})
+}
+
+func TestAEADSelectionMatchesCPUCapability(t *testing.T) {
+	// selectAEAD's decision must track hasAESHardware exactly — this
+	// is the auto-selection contract itself, not an implementation
+	// detail. A mismatch would mean either wasting AES-NI hardware
+	// (falling back to ChaCha20 on a CPU that has it) or running
+	// software-path AES-GCM (slow and side-channel-risky without
+	// hardware acceleration).
+	wantName := "chacha20-poly1305"
+	if hasAESHardware() {
+		wantName = "aes-256-gcm"
+	}
+	if AEADName != wantName {
+		t.Errorf("AEADName = %q, want %q (hasAESHardware=%v)", AEADName, wantName, hasAESHardware())
+	}
+}
+
+func TestSelectAEADProducesWorkingCipher(t *testing.T) {
+	// Whichever algorithm selectAEAD picks on this machine, it must
+	// actually round-trip: this is what would break if the AES-NI
+	// path (aes.NewCipher + cipher.NewGCM) were wired up incorrectly
+	// — the ChaCha20 path already had test coverage before this
+	// auto-selection existed, so this test's value is specifically in
+	// exercising whatever selectAEAD chooses, not a fixed algorithm.
+	var key [32]byte
+	if _, err := rand.Read(key[:]); err != nil {
+		t.Fatal(err)
+	}
+	aead, err := selectAEAD(key[:])
+	if err != nil {
+		t.Fatalf("selectAEAD: %v", err)
+	}
+	if aead.NonceSize() != NonceSize {
+		t.Errorf("NonceSize() = %d, want %d (%s)", aead.NonceSize(), NonceSize, AEADName)
+	}
+	if aead.Overhead() != TagSize {
+		t.Errorf("Overhead() = %d, want %d (%s)", aead.Overhead(), TagSize, AEADName)
+	}
+
+	nonce := make([]byte, NonceSize)
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatal(err)
+	}
+	plaintext := []byte("aead auto-selection round trip")
+	ciphertext := aead.Seal(nil, nonce, plaintext, nil)
+	opened, err := aead.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		t.Fatalf("Open: %v (%s)", err, AEADName)
+	}
+	if string(opened) != string(plaintext) {
+		t.Errorf("round trip mismatch: got %q, want %q", opened, plaintext)
+	}
 }
