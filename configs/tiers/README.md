@@ -42,3 +42,24 @@ Notes:
   pair was run through a full client↔server session — QUIC pool at
   the configured `pool_size`, `admin bench throughput`/`latency`, and
   a real SOCKS5 relay fetch all worked correctly.
+
+## Using these with scripts/spoof-tunnel.sh
+
+The manager script's "New tunnel" wizard picks a tier interactively
+and uses the matching `<tier>-server.json` / `<tier>-client.json` here
+as its starting template (overriding the name/IP/key/TUN fields you
+enter, keeping the tier's performance knobs). It expects this
+directory to sit next to the script and the `quiccochet` binary as
+`tiers/`, e.g.:
+
+```
+/opt/quiccochet/quiccochet
+/opt/quiccochet/spoof-tunnel.sh
+/opt/quiccochet/tiers/light-server.json
+/opt/quiccochet/tiers/light-client.json
+...
+```
+
+Copy this whole `configs/tiers/` directory to `tiers/` alongside the
+binary and script when deploying; the wizard fails with a clear error
+naming the missing path if it isn't found.
