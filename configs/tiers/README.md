@@ -60,6 +60,8 @@ directory to sit next to the script and the `quiccochet` binary as
 ...
 ```
 
-Copy this whole `configs/tiers/` directory to `tiers/` alongside the
-binary and script when deploying; the wizard fails with a clear error
-naming the missing path if it isn't found.
+`install.sh` and the release tarballs already lay it out this way, so
+in a normal install there is nothing to do. When deploying by hand,
+copy this whole `configs/tiers/` directory to `tiers/` alongside the
+binary and script; the wizard fails with a clear error naming the
+missing path if it isn't found.
