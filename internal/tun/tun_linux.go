@@ -23,12 +23,24 @@ import (
 const (
 	ifnameSize = unix.IFNAMSIZ
 
-	// From linux/if_tun.h — not exposed by golang.org/x/sys/unix.
-	tunSetIff     = 0x400454ca
-	tunSetPersist = 0x400454cb
-	iffTun        = 0x0001
-	iffNoPI       = 0x1000
-	iffMultiQueue = 0x0100
+	// TUNSETIFF/TUNSETPERSIST come from golang.org/x/sys/unix rather
+	// than being hardcoded, because the ioctl request number is NOT
+	// the same on every Linux architecture: the generic _IOC encoding
+	// puts the "write" direction bit at 0x40000000 (amd64, arm64, arm,
+	// 386, riscv64 → 0x400454ca), while the MIPS/PowerPC/SPARC
+	// encoding puts it at 0x80000000 (mips*, ppc* → 0x800454ca). A
+	// hardcoded generic value still compiles for those targets and
+	// then fails at runtime with EINVAL on the very first TUNSETIFF,
+	// so let x/sys supply the per-GOARCH value.
+	//
+	// The IFF_* values below ARE architecture-independent (they are
+	// struct-field bit flags, not ioctl numbers), but come from the
+	// same place for consistency.
+	tunSetIff     = unix.TUNSETIFF
+	tunSetPersist = unix.TUNSETPERSIST
+	iffTun        = unix.IFF_TUN
+	iffNoPI       = unix.IFF_NO_PI
+	iffMultiQueue = unix.IFF_MULTI_QUEUE
 )
 
 type ifReq struct {
@@ -88,9 +100,7 @@ type Device struct {
 
 // Open creates (or attaches to, if persistent and already present)
 // the TUN device described by cfg, assigns its address, sets its MTU,
-// and brings it up. The returned Device's file descriptor is
-// O_NONBLOCK-safe under the Go runtime poller (os.File wraps it with
-// the standard netpoller integration).
+// and brings it up.
 //
 // Equivalent to OpenQueues(cfg, 1)[0] — a single, non-multiqueue
 // device. Use OpenQueues directly when multiple parallel reader/

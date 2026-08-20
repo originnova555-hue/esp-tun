@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to build and release (e.g. v1.14.0)'
+        description: 'Existing tag to build and release (e.g. v2.1.0)'
         required: true
         type: string
 
@@ -15,7 +15,33 @@ permissions:
   contents: write
 
 jobs:
+  # Gate the release on a green build/vet/test so a broken tag can
+  # never publish binaries. Tests that need root (raw sockets, TUN)
+  # skip themselves on the unprivileged runner rather than failing.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test
+        run: go test ./... -count=1
+
+      - name: shellcheck syntax of the shipped scripts
+        run: |
+          bash -n scripts/spoof-tunnel.sh
+          bash -n install.sh
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -49,15 +75,43 @@ jobs:
           CGO_ENABLED: 0
           VERSION: ${{ steps.ver.outputs.name }}
         run: |
+          set -euo pipefail
           SUFFIX="${GOOS}-${GOARCH}"
           [ -n "${GOARM}" ] && SUFFIX="${SUFFIX}v${GOARM}"
           LDFLAGS="-s -w -X main.Version=${VERSION} -X main.Commit=$(git rev-parse --short HEAD) -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           go build -ldflags "${LDFLAGS}" -o "quiccochet-${SUFFIX}" ./cmd/quiccochet/
+          echo "SUFFIX=${SUFFIX}" >> "$GITHUB_ENV"
+
+      # The manager script resolves the binary and the tier templates
+      # relative to its own directory, so the release ships them as one
+      # unit. install.sh downloads exactly this tarball; the bare binary
+      # is uploaded too for anyone who only wants the daemon.
+      #
+      # The tarball name deliberately carries NO version: that is what
+      # lets install.sh fetch it from the stable
+      # /releases/latest/download/<name> URL without first querying the
+      # API for the current tag (no jq dependency, no rate limit). The
+      # version is still stamped into the binary via ldflags and is on
+      # the release itself.
+      - name: package toolkit tarball
+        run: |
+          set -euo pipefail
+          STAGE="stage/quiccochet"
+          mkdir -p "${STAGE}/tiers"
+          cp "quiccochet-${SUFFIX}" "${STAGE}/quiccochet"
+          chmod 755 "${STAGE}/quiccochet"
+          cp scripts/spoof-tunnel.sh "${STAGE}/spoof-tunnel.sh"
+          chmod 755 "${STAGE}/spoof-tunnel.sh"
+          cp configs/tiers/*.json configs/tiers/README.md "${STAGE}/tiers/"
+          tar -C stage -czf "quiccochet-${SUFFIX}.tar.gz" quiccochet
+          rm -rf stage
 
       - uses: actions/upload-artifact@v7
         with:
-          name: quiccochet-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}
-          path: quiccochet-*
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}
+          path: |
+            quiccochet-*
+            !stage
 
   release:
     needs: build
@@ -77,5 +131,6 @@ jobs:
         run: |
           gh release create "${VERSION}" \
             --repo "${{ github.repository }}" \
+            --title "${VERSION}" \
             --generate-notes \
             quiccochet-* checksums.txt

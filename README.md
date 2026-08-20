@@ -50,6 +50,7 @@
   - [Why QUIC?](#why-quic)
 - [Manual Setup & Configuration Reference](#manual-setup)
   - [Prerequisites & Build from Source](#prerequisites)
+  - [Prebuilt Releases](#releases)
   - [Manual Config (no wizard)](#manual-config)
   - [Required Fields](#required-fields)
   - [Transport Details](#transport-details)
@@ -99,7 +100,7 @@ One machine is the **Iran-side / server** (has the real public IP everyone conne
 bash <(curl -fsSL https://raw.githubusercontent.com/originnova555-hue/esp-tun/claude/quiccochet-tunnel-refactor-owaip5/install.sh)
 ```
 
-This builds `quiccochet` from source (there are no prebuilt release binaries for this fork — the installer fetches an official Go 1.25+ toolchain itself if your distro's is too old), installs it at `/opt/quiccochet/` together with the manager script and the four tier templates, links `spoof-tunnel` into your `PATH`, and — on an interactive terminal — opens the manager menu immediately. Reopen it any time with:
+The installer downloads the prebuilt release for your CPU (`x86_64`, `aarch64`, or `armv7`), **verifies it against the release's published `checksums.txt` and refuses to install on a mismatch**, and unpacks `quiccochet` together with the manager script and the four tier templates into `/opt/quiccochet/`. If there's no release asset for your architecture — or you pass `FORCE_SOURCE=1` — it builds from source instead, fetching an official Go 1.25+ toolchain itself when your distro's is too old. Either way it links `spoof-tunnel` into your `PATH` and, on an interactive terminal, opens the manager menu immediately. Reopen it any time with:
 
 ```bash
 sudo spoof-tunnel
@@ -292,6 +293,32 @@ go build -ldflags "-X main.Version=$(git describe --tags --always) -X main.Commi
 ```
 
 `keygen` prints an X25519 key pair to stdout by default; pass `--out-private FILE` to write the private half straight to a `0600` file instead of leaving it in your shell history/terminal scrollback (the wizard always uses this form).
+
+<a id="releases"></a>
+### Prebuilt Releases
+
+Each tagged release publishes, per architecture (`linux-amd64`, `linux-arm64`, `linux-armv7`):
+
+| Asset | Contents |
+|---|---|
+| `quiccochet-<arch>.tar.gz` | The full toolkit: `quiccochet`, `spoof-tunnel.sh`, and `tiers/` — the layout the manager script expects. This is what `install.sh` downloads. |
+| `quiccochet-<arch>` | The bare daemon binary, for anyone who only wants that. |
+| `checksums.txt` | SHA-256 of every asset above. |
+
+Binaries are static (`CGO_ENABLED=0`) and stripped (`-s -w`), with the version, commit, and build time stamped in via `-ldflags` — check with `quiccochet --version`. Asset names carry no version, so `https://github.com/originnova555-hue/esp-tun/releases/latest/download/quiccochet-linux-amd64.tar.gz` always resolves to the newest release.
+
+To install a specific release, or to verify by hand:
+
+```bash
+ARCH=linux-amd64   # or linux-arm64 / linux-armv7
+BASE=https://github.com/originnova555-hue/esp-tun/releases/latest/download
+curl -fsSLO "$BASE/quiccochet-$ARCH.tar.gz"
+curl -fsSLO "$BASE/checksums.txt"
+sha256sum --check --ignore-missing checksums.txt   # must print OK
+tar xzf "quiccochet-$ARCH.tar.gz"                  # unpacks ./quiccochet/
+```
+
+Other CPU architectures (386, riscv64, mips64le, ppc64le, …) are not published as binaries but do build correctly from source — the TUN layer takes its `ioctl` request numbers from `golang.org/x/sys/unix` per-GOARCH rather than hardcoding the x86 values, which differ on MIPS/PowerPC.
 
 <a id="manual-config"></a>
 ### Manual Config (no wizard)

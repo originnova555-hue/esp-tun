@@ -351,6 +351,9 @@ func TestNewUDPTransportDualStackBindMode(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.v6Src != nil && !kernelHasIPv6() {
+				t.Skip("skipping (kernel has no IPv6 stack): this subtest binds a real AF_INET6 socket")
+			}
 			cfg := &Config{
 				SourceIP:      tc.v4Src,
 				SourceIPv6:    tc.v6Src,
@@ -429,6 +432,22 @@ func TestNewUDPTransportDualStackAsymmetricPeerSpoofRejected(t *testing.T) {
 func isPermissionDenied(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "permission denied") || strings.Contains(msg, "CAP_NET_RAW")
+}
+
+// kernelHasIPv6 reports whether this kernel can create AF_INET6
+// sockets at all. Containers started with
+// `--sysctl net.ipv6.conf.all.disable_ipv6=1`, images built from a
+// kernel with CONFIG_IPV6=n, and some minimal CI sandboxes have no
+// IPv6 stack, where every AF_INET6 socket() fails with EAFNOSUPPORT.
+// Tests that bind a real v6 socket must skip there rather than report
+// a failure that says nothing about the code under test.
+func kernelHasIPv6() bool {
+	fd, err := unix.Socket(unix.AF_INET6, unix.SOCK_DGRAM, 0)
+	if err != nil {
+		return false
+	}
+	_ = unix.Close(fd)
+	return true
 }
 
 // TestBuildPktinfo6 pins the cmsg layout for IPV6_PKTINFO. The kernel
