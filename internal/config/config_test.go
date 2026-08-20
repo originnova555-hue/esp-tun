@@ -585,6 +585,36 @@ func TestSetDefaults(t *testing.T) {
 		}
 	})
 
+	// TUN clients don't get the legacy SOCKS5 default: it would open an
+	// unused loopback proxy nobody asked for alongside the L3 datapath.
+	t.Run("no default inbound when TUN enabled", func(t *testing.T) {
+		tunCfg := Config{
+			Mode: ModeClient,
+			Spoof: SpoofConfig{
+				SourceIPs: []string{"192.168.1.1"},
+			},
+			Server: ServerConfig{
+				Address: "10.0.0.1",
+				Port:    8080,
+			},
+			Crypto: CryptoConfig{
+				PrivateKey:    "key",
+				PeerPublicKey: "peer-key",
+			},
+			TUN: TUNConfig{
+				Enabled: true,
+				Name:    "qc0",
+				Local:   "10.20.0.2/24",
+			},
+		}
+		if err := tunCfg.setDefaults(); err != nil {
+			t.Fatalf("setDefaults() returned error: %v", err)
+		}
+		if len(tunCfg.Inbounds) != 0 {
+			t.Errorf("expected no default inbounds with TUN enabled, got %v", tunCfg.Inbounds)
+		}
+	})
+
 	// Server mode: listen port default is 8080
 	t.Run("server listen port default", func(t *testing.T) {
 		srv := Config{Mode: ModeServer}

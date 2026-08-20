@@ -47,6 +47,39 @@ list_tunnels() {
         | sed 's|.*/||;s|\.json$||' | sort
 }
 
+# tun_name_owner <iface> [skip_tunnel] — prints the tunnel name that
+# already has tun.name == <iface> in its config, empty if none. Used to
+# stop two tunnels on the same box from fighting over one TUN device
+# (each is a separate process opening/attaching to it independently).
+tun_name_owner() {
+    local iface="$1" skip="${2:-}" t cfg other
+    for t in $(list_tunnels); do
+        [[ "$t" == "$skip" ]] && continue
+        cfg="$(cfg_path "$t")"
+        other="$(json_get "$cfg" "tun.name" "")"
+        if [[ "$other" == "$iface" ]]; then
+            printf '%s' "$t"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# next_free_tun_name — first qc<N> (N=0,1,2,...) not already claimed by
+# an existing tunnel's tun.name, for use as this new tunnel's default.
+next_free_tun_name() {
+    # Pre-increment: with n starting at 0, `((n++))` evaluates to the
+    # *old* value (0) on the first taken name, whose arithmetic truth
+    # is false — under `set -e` that would kill the whole script right
+    # here. `((++n))` evaluates to the new (post-increment) value instead,
+    # which is never zero.
+    local n=0
+    while tun_name_owner "qc${n}" >/dev/null; do
+        ((++n))
+    done
+    printf 'qc%d' "$n"
+}
+
 svc_state() {
     systemctl is-active "$(svc_name "$1")" 2>/dev/null || printf 'inactive'
 }
@@ -148,6 +181,33 @@ local_ip() {
     # entry, so swallow the failure and return empty.
     { ip -4 route get 8.8.8.8 2>/dev/null \
         | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1; } || true
+}
+
+# suggested_tier — picks a default tier (1=light .. 4=ultra) from this
+# box's real core count / RAM, so a weak VPS defaults toward light/medium
+# and a strong or dedicated box defaults toward high/ultra instead of
+# everyone landing on the same guess. Whichever signal is weaker wins
+# (a low-RAM/high-core or high-RAM/low-core box is still a weak box for
+# this purpose) — this is only ever a starting suggestion, the operator
+# picks the number and can override it.
+suggested_tier() {
+    local cores mem_kb mem_gb by_cores by_mem
+    cores="$(nproc 2>/dev/null || echo 1)"
+    mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)"
+    mem_gb=$(( ${mem_kb:-0} / 1024 / 1024 ))
+
+    if   (( cores >= 8 )); then by_cores=4
+    elif (( cores >= 4 )); then by_cores=3
+    elif (( cores >= 2 )); then by_cores=2
+    else                        by_cores=1
+    fi
+    if   (( mem_gb >= 8 )); then by_mem=4
+    elif (( mem_gb >= 4 )); then by_mem=3
+    elif (( mem_gb >= 2 )); then by_mem=2
+    else                         by_mem=1
+    fi
+
+    (( by_cores < by_mem )) && printf '%s' "$by_cores" || printf '%s' "$by_mem"
 }
 
 clr()   { printf '\033[2J\033[H'; }
@@ -282,9 +342,7 @@ tunnel_manage_menu() {
             11) require_root
                br; printf "  ${Y}Remove tunnel '${name}'? [y/N]:${RST} "; read -r ans
                if [[ "${ans,,}" == "y" ]]; then
-                   _remove_svc "$name"
-                   rm -f "$cfg"
-                   ip link delete "$(json_get "$cfg" "tun.name" "")" 2>/dev/null || true
+                   _remove_tunnel "$name"
                    pok "Removed: $name"; pause; return
                fi ;;
             12|b|B|q|Q) return ;;
@@ -362,6 +420,10 @@ tunnel_new_wizard() {
     while true; do
         printf "  [${default_name}]: "; read -r name
         name="${name:-$default_name}"
+        if [[ ! "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            pw "Only letters, numbers, '-' and '_' allowed (this name becomes a systemd unit and file name)"
+            continue
+        fi
         cfg="$(cfg_path "$name")"
         if [[ -f "$cfg" ]]; then
             pw "Config already exists: $cfg"
@@ -383,9 +445,15 @@ tunnel_new_wizard() {
     p  "  ${BOLD}2)${RST} Medium  ${DIM}— 20-100 users${RST}"
     p  "  ${BOLD}3)${RST} High    ${DIM}— 100-500 users${RST}"
     p  "  ${BOLD}4)${RST} Ultra   ${DIM}— thousands of users, dedicated box${RST}"
-    printf "  Tier [2]: "; read -r tier_choice
+    br
+    local sug_tier sug_cores sug_mem
+    sug_tier="$(suggested_tier)"
+    sug_cores="$(nproc 2>/dev/null || echo '?')"
+    sug_mem="$(awk '/^MemTotal:/ {printf "%.1f", $2/1024/1024}' /proc/meminfo 2>/dev/null)"
+    p  "  ${DIM}Detected: ${sug_cores} CPU core(s), ~${sug_mem:-?} GB RAM → suggested: ${sug_tier}${RST}"
+    printf "  Tier [${sug_tier}]: "; read -r tier_choice
     local tier
-    case "${tier_choice:-2}" in
+    case "${tier_choice:-$sug_tier}" in
         1) tier="light" ;;
         3) tier="high" ;;
         4) tier="ultra" ;;
@@ -428,8 +496,29 @@ tunnel_new_wizard() {
     # ── Tunnel settings ───────────────────────────────────────────────────────
     br; sep
     p  "  ${BOLD}Tunnel settings${RST}"
-    printf "  UDP port      [6262]: ";  read -r port;   port="${port:-6262}"
-    printf "  TUN interface [qc0]: ";   read -r tname;  tname="${tname:-qc0}"
+    local port=""
+    while true; do
+        printf "  UDP port      [6262]: ";  read -r port;   port="${port:-6262}"
+        [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) && break
+        pw "Port must be a number between 1 and 65535"
+    done
+
+    local suggested_tname; suggested_tname="$(next_free_tun_name)"
+    local tname="" owner
+    while true; do
+        printf "  TUN interface [${suggested_tname}]: "; read -r tname
+        tname="${tname:-$suggested_tname}"
+        if [[ ! "$tname" =~ ^[A-Za-z0-9_-]{1,15}$ ]]; then
+            pw "Interface name must be 1-15 chars, letters/numbers/-/_ only (Linux ifname limit)"
+            continue
+        fi
+        owner="$(tun_name_owner "$tname" "$name")" || true
+        if [[ -n "$owner" ]]; then
+            pw "Interface '$tname' is already used by tunnel '$owner' on this box — pick another"
+            continue
+        fi
+        break
+    done
     printf "  TUN local IP  [${default_tun_local}]: ";  read -r tlocal
     tlocal="${tlocal:-$default_tun_local}"
     printf "  TUN peer IP   [${default_tun_remote}]: "; read -r tremote
@@ -442,7 +531,8 @@ tunnel_new_wizard() {
     mkdir -p "$CONFIG_DIR"
     local keyfile="${CONFIG_DIR}/${name}.key"
     local keygen_out; keygen_out="$("$BINARY" keygen --out-private "$keyfile" 2>&1)" \
-        || die "keygen failed:\n$keygen_out"
+        || die "keygen failed:
+$keygen_out"
     local own_pub; own_pub="$(printf '%s\n' "$keygen_out" | grep "Public Key" | awk '{print $4}')"
     local own_priv; own_priv="$(cat "$keyfile")"
     pok "Generated key pair, private key saved: $keyfile"
@@ -450,9 +540,22 @@ tunnel_new_wizard() {
     p  "  ${W}${own_pub}${RST}"
     br
     local peer_pub=""
-    while [[ -z "$peer_pub" ]]; do
+    while true; do
         printf "  Peer's public key: "; read -r peer_pub
-        [[ -z "$peer_pub" ]] && pw "Required — cannot be empty"
+        if [[ -z "$peer_pub" ]]; then
+            pw "Required — cannot be empty"; continue
+        fi
+        # X25519 key, base64: 32 bytes -> 44 chars incl. the '=' pad.
+        # Also guards the config-writing step below, which embeds this
+        # verbatim into a JSON string inside an unquoted heredoc — a
+        # pasted value with a stray quote or newline would otherwise
+        # break that Python script instead of failing with a clear
+        # message here.
+        if [[ ! "$peer_pub" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+            pw "Doesn't look like a valid key (expected 44 base64 chars, e.g. from 'quiccochet keygen'). Check for a copy-paste truncation."
+            continue
+        fi
+        break
     done
 
     # ── Server-only: this peer's TUN address ────────────────────────────────
@@ -477,6 +580,9 @@ tunnel_new_wizard() {
             printf "  Forward #${idx} — listen port on this server (Enter to finish): "
             read -r lport
             [[ -z "$lport" ]] && break
+            if [[ ! "$lport" =~ ^[0-9]+$ ]] || (( lport < 1 || lport > 65535 )); then
+                pw "Port must be a number between 1 and 65535"; continue
+            fi
             printf "  Target on the peer (host:port) [127.0.0.1:${lport}]: "
             read -r target
             target="${target:-127.0.0.1:${lport}}"
@@ -655,6 +761,27 @@ _remove_svc() {
     pok "Service removed: $svc"
 }
 
+# Full teardown for one tunnel: service, config, private key, TUN
+# interface. Shared by the TUI menu and the `remove` CLI command so
+# there's exactly one place that has to remember all four — the config
+# and TUN name must be read out *before* the config file is deleted.
+_remove_tunnel() {
+    local name="$1"
+    local cfg; cfg="$(cfg_path "$name")"
+    local tun_iface=""
+    [[ -f "$cfg" ]] && tun_iface="$(json_get "$cfg" "tun.name" "")"
+    _remove_svc "$name"
+    rm -f "$cfg" "${CONFIG_DIR}/${name}.key"
+    # The interface is usually already gone (tunnel was stopped, or
+    # never started) — that's success, not a failure to report. Only a
+    # non-"no such device" error should be worth surfacing, and even
+    # then this is best-effort cleanup, not something to fail loudly.
+    if [[ -n "$tun_iface" ]]; then
+        ip link delete "$tun_iface" 2>/dev/null || true
+    fi
+    return 0
+}
+
 # ── CLI mode ──────────────────────────────────────────────────────────────────
 cli_help() {
     p  "Usage: $(basename "$0") [command] [tunnel-name] [args...]"
@@ -712,7 +839,7 @@ cli_cmd() {
             local dur="${2:-5}"
             "$BINARY" admin --socket "$sock" -H bench latency "${dur}s"
             "$BINARY" admin --socket "$sock" -H bench throughput "${dur}s" 4 ;;
-        remove)    require_root; _remove_svc "$name"; rm -f "$(cfg_path "$name")" ;;
+        remove)    require_root; _remove_tunnel "$name" ;;
         keygen)    require_binary; "$BINARY" keygen ;;
         help|--help|-h) cli_help ;;
         *) pw "Unknown command: $cmd"; br; cli_help; exit 1 ;;

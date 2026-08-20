@@ -820,8 +820,14 @@ func (c *Config) setDefaults() error {
 		c.TUN.MTU = 1360
 	}
 
-	// Default inbound: if no inbounds defined in client mode, create a SOCKS5 listener
-	if len(c.Inbounds) == 0 && c.Mode == ModeClient {
+	// Default inbound: if no inbounds defined in client mode, create a SOCKS5
+	// listener — but only when TUN is off. With TUN enabled the client
+	// already routes all traffic at L3; silently also opening a loopback
+	// SOCKS5 proxy nobody asked for wastes a listener/goroutine and is
+	// confusing (traffic sent at an app through it bypasses the TUN
+	// datapath's spoofing/pinning instead of using it). A TUN client that
+	// still wants SOCKS5 can list it explicitly in inbounds.
+	if len(c.Inbounds) == 0 && c.Mode == ModeClient && !c.TUN.Enabled {
 		c.Inbounds = []InboundConfig{{
 			Type:   InboundSocks,
 			Listen: "127.0.0.1:1080",
