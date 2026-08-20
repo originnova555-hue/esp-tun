@@ -1,29 +1,38 @@
 {
-  "_tier": "High — strong VPS/dedicated, 100-500 concurrent users.",
+  "_tier": "High \u2014 strong VPS/dedicated, 100-500 concurrent users.",
   "__usage": "Fill in SERVER_IP / SERVER_SPOOF_IP / CLIENT_SPOOF_IP / keys, then run: quiccochet -c high-client.json",
-  "___obfuscation": "obfuscation.mode is \"none\" by default for max throughput. Switch to \"standard\" only if this deployment is actually under active DPI (padding costs real CPU under load — see docs/PROFILING-BASELINE.md). Must match the server's setting.",
-
+  "___obfuscation": "obfuscation.mode is \"none\" by default for max throughput. Switch to \"standard\" only if this deployment is actually under active DPI (padding costs real CPU under load \u2014 see docs/PROFILING-BASELINE.md). Must match the server's setting.",
   "mode": "client",
-  "transport": { "type": "udp" },
-  "listen_port": 0,
-  "server": { "address": "SERVER_IP", "port": 8080 },
-
-  "spoof": {
-    "source_ips": ["CLIENT_SPOOF_IP"],
-    "peer_spoof_ips": ["SERVER_SPOOF_IP"]
+  "transport": {
+    "type": "udp"
   },
-  "crypto": { "private_key": "", "peer_public_key": "" },
-
+  "listen_port": 0,
+  "server": {
+    "address": "SERVER_IP",
+    "port": 8080
+  },
+  "spoof": {
+    "source_ips": [
+      "CLIENT_SPOOF_IP"
+    ],
+    "peer_spoof_ips": [
+      "SERVER_SPOOF_IP"
+    ]
+  },
+  "crypto": {
+    "private_key": "",
+    "peer_public_key": ""
+  },
   "tun": {
     "enabled": true,
     "name": "qc0",
     "local": "10.20.0.2/24",
-    "mtu": 1360,
     "queues": 4,
     "pin_cores": true
   },
-
-  "obfuscation": { "mode": "none" },
+  "obfuscation": {
+    "mode": "none"
+  },
   "quic": {
     "pool_size": 10,
     "congestion_control": "bbrv1"
@@ -32,7 +41,12 @@
     "read_buffer": 25165824,
     "write_buffer": 25165824
   },
-
-  "logging": { "level": "info", "file": "" },
-  "metrics": { "enabled": true, "listen": "127.0.0.1:9200" }
+  "logging": {
+    "level": "info",
+    "file": ""
+  },
+  "metrics": {
+    "enabled": true,
+    "listen": "127.0.0.1:9200"
+  }
 }

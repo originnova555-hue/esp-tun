@@ -151,13 +151,29 @@ Key `tun{}` config fields (all four tier templates set these; adjust per tier or
 | `tun.enabled` | Turn on the TUN datapath |
 | `tun.name` | Interface name, e.g. `qc0`. The wizard auto-suggests a free `qcN` per box |
 | `tun.local` | This side's point-to-point address in CIDR form, e.g. `10.20.0.2/24` |
-| `tun.mtu` | Must leave headroom for whole IP packets inside one QUIC datagram after framing overhead — the tier templates set this correctly; don't raise it past `performance.mtu` minus obfuscator/framing overhead |
+| `tun.mtu` | **Leave this unset.** It is derived from `performance.mtu` so a whole inner IP packet always fits in one QUIC datagram. Setting it too high does not slow the tunnel down — it black-holes it: ping, DNS and TCP handshakes still pass while every full-size segment is dropped, so the link looks healthy and moves zero data. A too-large value is clamped at startup with a `WARN`. See [Inner MTU](#inner-mtu) |
 | `tun.queues` | Parallel `IFF_MULTI_QUEUE` queues, one goroutine each. `/dev/net/tun` has no `recvmmsg` equivalent, so this — not a generic "thread count" — is what actually scales packet processing across cores; set it to your real core count on High/Ultra |
 | `tun.pin_cores` | Pin each queue's goroutine to a specific core (`runtime.LockOSThread` + `sched_setaffinity`) for cache locality on multi-queue tiers |
 | `tun.persist` | Ask the kernel to keep the interface alive independent of the fd (`TUNSETPERSIST`) |
 | `peers[].tun_addr` (server, per peer) | This peer's inner IP on the server's shared TUN subnet — the routing key the server uses to send an inbound-from-TUN packet to the right peer's QUIC session. Must fall inside `tun.local`'s subnet and be disjoint across peers |
 
 Server mode with TUN enabled serves multiple peers over **one shared TUN device**; routing is by destination IP within that subnet (`peers[].tun_addr`), not by a separate interface per peer.
+
+<a id="inner-mtu"></a>
+### Inner MTU — why you should not set `tun.mtu`
+
+An inner IP packet travels inside a single QUIC DATAGRAM frame, so it has a hard size ceiling. Exceed it and the failure mode is unusually nasty: **small packets keep working while every full-size one is dropped.** `ping` replies, DNS resolves, TCP connections complete their handshake — and then `iperf3` reports exactly `0.00 bits/sec`, because the first full-MSS data segment never arrives and TCP retransmits it forever. Nothing looks broken: the QUIC pool is healthy, the interface is up, `admin stats` shows sessions.
+
+The ceiling is the smaller of two budgets:
+
+- **Scaling with `performance.mtu`**: `quic.InitialPacketSize` is `performance.mtu − 31` (obfuscator framing + nonce + tag), and quic-go caps a datagram payload at `packetSize − 37` (type byte + max connection ID + AEAD tag). One more byte goes to the datagram-type prefix that separates TUN packets from UDP-relay payloads, so the inner packet gets `performance.mtu − 69`.
+- **An absolute cap** that does *not* scale with `performance.mtu`. Measured end-to-end over a veth pair: `tun.mtu=1342` sustained ~1 Gbps and `1343` gave exactly 0, identically at `performance.mtu` 1400 and 1450.
+
+So the daemon derives it: leave `tun.mtu` out of the config (the tier templates do) and it computes a safe value — 1300 at the default `performance.mtu` of 1400. A config that sets it too high is clamped at startup with a loud `WARN` naming the configured and corrected values, rather than being rejected, so an already-deployed tunnel starts passing traffic again on upgrade instead of refusing to start.
+
+If a packet ever does exceed the ceiling at runtime, the daemon now logs a rate-limited `WARN` naming the packet size and the real maximum — this used to be a `DEBUG` line, which is why the condition could hide behind a healthy-looking tunnel.
+
+Note that `performance.mtu` has its own separate constraint: the outer packet is `performance.mtu + 28` bytes on the wire (IP + UDP headers), so it must fit the path MTU. At a 1500-byte path, keep `performance.mtu` at or below ~1460.
 
 <a id="performance-tiers"></a>
 ## ⚙️ Performance Tiers

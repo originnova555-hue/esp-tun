@@ -1,29 +1,38 @@
 {
-  "_tier": "Ultra — high-end dedicated box, thousands of concurrent users.",
+  "_tier": "Ultra \u2014 high-end dedicated box, thousands of concurrent users.",
   "__usage": "Fill in SERVER_IP / SERVER_SPOOF_IP / CLIENT_SPOOF_IP / keys, then run: quiccochet -c ultra-client.json",
-  "___tuning": "tun.queues and quic.pool_size below assume an 8-core box — set both to your actual core count. performance.pacing_rate_mbps should sit slightly below this client's real uplink capacity once you know it; 0 leaves pacing disabled.",
-
+  "___tuning": "tun.queues and quic.pool_size below assume an 8-core box \u2014 set both to your actual core count. performance.pacing_rate_mbps should sit slightly below this client's real uplink capacity once you know it; 0 leaves pacing disabled.",
   "mode": "client",
-  "transport": { "type": "udp" },
-  "listen_port": 0,
-  "server": { "address": "SERVER_IP", "port": 8080 },
-
-  "spoof": {
-    "source_ips": ["CLIENT_SPOOF_IP"],
-    "peer_spoof_ips": ["SERVER_SPOOF_IP"]
+  "transport": {
+    "type": "udp"
   },
-  "crypto": { "private_key": "", "peer_public_key": "" },
-
+  "listen_port": 0,
+  "server": {
+    "address": "SERVER_IP",
+    "port": 8080
+  },
+  "spoof": {
+    "source_ips": [
+      "CLIENT_SPOOF_IP"
+    ],
+    "peer_spoof_ips": [
+      "SERVER_SPOOF_IP"
+    ]
+  },
+  "crypto": {
+    "private_key": "",
+    "peer_public_key": ""
+  },
   "tun": {
     "enabled": true,
     "name": "qc0",
     "local": "10.20.0.2/24",
-    "mtu": 1360,
     "queues": 8,
     "pin_cores": true
   },
-
-  "obfuscation": { "mode": "none" },
+  "obfuscation": {
+    "mode": "none"
+  },
   "quic": {
     "pool_size": 16,
     "congestion_control": "bbrv1"
@@ -33,7 +42,12 @@
     "write_buffer": 33554432,
     "pacing_rate_mbps": 0
   },
-
-  "logging": { "level": "warn", "file": "" },
-  "metrics": { "enabled": true, "listen": "127.0.0.1:9200" }
+  "logging": {
+    "level": "warn",
+    "file": ""
+  },
+  "metrics": {
+    "enabled": true,
+    "listen": "127.0.0.1:9200"
+  }
 }

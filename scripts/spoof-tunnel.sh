@@ -8,7 +8,20 @@
 # =============================================================================
 set -euo pipefail
 
-BINARY_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Resolve $0 through any symlinks before deriving the install
+# directory. install.sh puts a `spoof-tunnel` symlink in /usr/local/bin
+# pointing at the real script; without this, invoking that symlink would
+# set BINARY_DIR=/usr/local/bin and every sibling lookup below (the
+# quiccochet binary, tiers/) would miss — which shows up as the wizard
+# failing to find a tier template while running the script by its real
+# path works fine.
+_self="$0"
+if command -v readlink >/dev/null 2>&1; then
+    _resolved="$(readlink -f "$_self" 2>/dev/null || true)"
+    [[ -n "$_resolved" ]] && _self="$_resolved"
+fi
+BINARY_DIR="$(cd "$(dirname "$_self")" && pwd)"
+unset _self _resolved
 BINARY="$BINARY_DIR/quiccochet"
 TIERS_DIR="$BINARY_DIR/tiers"
 CONFIG_DIR="/etc/spoof-tunnel"
@@ -504,9 +517,23 @@ _admin_bench_menu() {
     if [[ -z "$sock" || ! -S "$sock" ]]; then
         pw "Admin socket not available (is the tunnel running, and admin.enabled in its config?)"; pause; return
     fi
+    # The bench is driven entirely from the client side (the server is
+    # passive with respect to bench requests), so running it against a
+    # server-mode daemon just returns "bench is only supported in client
+    # mode" twice. Say that up front instead of firing two doomed calls.
+    local cfg; cfg="$(cfg_path "$name")"
+    if [[ "$(json_get "$cfg" "mode" "")" == "server" ]]; then
+        header
+        p "  ${BOLD}Benchmark — ${name}${RST}"
+        br
+        pw "This tunnel is in server mode, and the benchmark is driven from the client side."
+        p "  ${DIM}Run it from the peer that dials this server — it measures the same${RST}"
+        p "  ${DIM}link in both directions. Use 'Live stats' here for this side's view.${RST}"
+        pause; return
+    fi
     header
     p "  ${BOLD}Benchmark — ${name}${RST}"
-    p "  ${DIM}Runs over the live tunnel; only meaningful in client mode.${RST}"
+    p "  ${DIM}Runs over the live tunnel.${RST}"
     br
     printf "  Duration in seconds [5]: "; read -r dur; dur="${dur:-5}"
     printf "  Parallel streams (throughput only) [4]: "; read -r par; par="${par:-4}"
@@ -1171,6 +1198,9 @@ cli_cmd() {
             require_python
             local sock; sock="$(_admin_socket_for "$name")"
             [[ -n "$sock" && -S "$sock" ]] || die "Admin socket not available (is the tunnel running?)"
+            # Same client-only constraint as the TUI path above.
+            [[ "$(json_get "$(cfg_path "$name")" "mode" "")" == "server" ]] && \
+                die "'$name' is in server mode; the benchmark is driven from the client side — run it on the peer that dials this server."
             local dur="${2:-5}"
             "$BINARY" admin --socket "$sock" -H bench latency "${dur}s"
             "$BINARY" admin --socket "$sock" -H bench throughput "${dur}s" 4 ;;

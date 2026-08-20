@@ -103,6 +103,9 @@ type Client struct {
 	// the outbound packet, so any queue works; spreading them avoids
 	// piling all inbound traffic onto queue 0.
 	tunWriteIdx atomic.Uint32
+	// tunOversize rate-limits the "inner packet too large" warning;
+	// see oversizeReporter in datagram.go for why it is a Warn.
+	tunOversize oversizeReporter
 }
 
 type udpAssoc struct {
@@ -1082,7 +1085,7 @@ func (c *Client) tunReadLoop(dev *tun.Device, core int) {
 		c.mu.RUnlock()
 
 		if sendErr != nil {
-			slog.Debug("tun: datagram send failed", "component", "tun", "size", n, "error", sendErr)
+			c.tunOversize.report("tun", n, sendErr)
 			continue
 		}
 		if sess != nil {

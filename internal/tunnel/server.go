@@ -162,6 +162,9 @@ type Server struct {
 	// tunWriteIdx round-robins which queue handleTUNDatagram writes
 	// inbound packets to.
 	tunWriteIdx atomic.Uint32
+	// tunOversize rate-limits the "inner packet too large" warning;
+	// see oversizeReporter in datagram.go for why it is a Warn.
+	tunOversize oversizeReporter
 
 	// tunRouteV4 / tunRouteV6 map each peer's inner TUN address
 	// (peers[].tun_addr, parsed) to its peer name — the routing key

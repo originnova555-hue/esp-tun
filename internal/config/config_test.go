@@ -1134,7 +1134,16 @@ func TestValidateTUNClientRequiresNameAndLocal(t *testing.T) {
 
 func TestValidateTUNClientValid(t *testing.T) {
 	cfg := validClientConfig()
-	cfg.TUN = TUNConfig{Enabled: true, Name: "qc0", Local: "10.20.0.2/24", MTU: 1360}
+	// MTU comes from MaxTUNMTU rather than a literal: this test used to
+	// hardcode 1360, which asserted that an MTU above the QUIC datagram
+	// ceiling was acceptable — the exact condition that black-holes all
+	// full-size traffic while leaving ping working.
+	cfg.TUN = TUNConfig{
+		Enabled: true,
+		Name:    "qc0",
+		Local:   "10.20.0.2/24",
+		MTU:     MaxTUNMTU(cfg.Performance.MTU),
+	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("expected no error for valid client tun config, got: %v", err)
 	}
@@ -1210,5 +1219,77 @@ func TestValidateTUNServerValid(t *testing.T) {
 	cfg.Peers[0].TUNAddr = "10.20.0.2"
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("expected no error for valid server tun config, got: %v", err)
+	}
+}
+
+// TestMaxTUNMTUStaysUnderMeasuredDatagramCliff pins the ceiling against
+// the value measured end-to-end rather than a re-derivation of the same
+// arithmetic the implementation uses.
+//
+// The cliff is not gradual: at tun.mtu 1342 an iperf3 run through the
+// tunnel sustained ~1 Gbps, and at 1343 it reported exactly 0 bits/sec,
+// because small packets still fit a QUIC datagram while every full-size
+// segment is dropped. Measured identically at performance.mtu 1400 and
+// 1450, i.e. the cap is absolute, not proportional — so a formula that
+// only scales with performance.mtu is not enough on its own.
+func TestMaxTUNMTUStaysUnderMeasuredDatagramCliff(t *testing.T) {
+	const measuredCliff = 1343 // first tun.mtu observed to black-hole
+
+	for _, perfMTU := range []int{1300, 1400, 1450, 1500, 9000} {
+		got := MaxTUNMTU(perfMTU)
+		if got >= measuredCliff {
+			t.Errorf("MaxTUNMTU(%d) = %d, which is at or above the measured black-hole threshold %d",
+				perfMTU, got, measuredCliff)
+		}
+	}
+}
+
+// TestMaxTUNMTUScalesDownWithPerformanceMTU guards the other half of the
+// budget: a small performance.mtu leaves less room for the inner packet,
+// and the ceiling has to follow it down even though the absolute cap is
+// nowhere near.
+func TestMaxTUNMTUScalesDownWithPerformanceMTU(t *testing.T) {
+	small := MaxTUNMTU(1300)
+	large := MaxTUNMTU(1400)
+	if small >= large {
+		t.Errorf("expected the ceiling to shrink with performance.mtu, got %d at 1300 and %d at 1400", small, large)
+	}
+	// performance.mtu 1300 -> InitialPacketSize 1269; the datagram
+	// payload budget is 1269-37, minus our 1-byte type prefix.
+	if want := 1300 - 69; small != want {
+		t.Errorf("MaxTUNMTU(1300) = %d, want %d", small, want)
+	}
+}
+
+// TestSetDefaultsClampsOversizeTUNMTU covers the upgrade path for the
+// configs already deployed with the too-large value: the daemon must
+// correct them and keep running, because refusing to start would turn a
+// silently-broken tunnel into an outage.
+func TestSetDefaultsClampsOversizeTUNMTU(t *testing.T) {
+	cfg := validClientConfig()
+	cfg.TUN = TUNConfig{Enabled: true, Name: "qc0", Local: "10.20.0.2/24", MTU: 1360}
+	if err := cfg.setDefaults(); err != nil {
+		t.Fatalf("setDefaults: %v", err)
+	}
+	ceiling := MaxTUNMTU(cfg.Performance.MTU)
+	if cfg.TUN.MTU != ceiling {
+		t.Errorf("tun.mtu = %d, want it clamped to %d", cfg.TUN.MTU, ceiling)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("a clamped config must still validate, got: %v", err)
+	}
+}
+
+// TestSetDefaultsDerivesTUNMTUWhenUnset is the new-tunnel path: the tier
+// templates no longer carry an explicit mtu, so an omitted value has to
+// produce a working one rather than a zero.
+func TestSetDefaultsDerivesTUNMTUWhenUnset(t *testing.T) {
+	cfg := validClientConfig()
+	cfg.TUN = TUNConfig{Enabled: true, Name: "qc0", Local: "10.20.0.2/24"}
+	if err := cfg.setDefaults(); err != nil {
+		t.Fatalf("setDefaults: %v", err)
+	}
+	if want := MaxTUNMTU(cfg.Performance.MTU); cfg.TUN.MTU != want {
+		t.Errorf("derived tun.mtu = %d, want %d", cfg.TUN.MTU, want)
 	}
 }

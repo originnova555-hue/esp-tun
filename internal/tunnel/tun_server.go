@@ -124,7 +124,7 @@ func (s *Server) tunReadLoop(dev *tun.Device, core int) {
 		buf[0] = datagramTypeTUN
 		pkt := buf[:1+n]
 		if err := sess.SendDatagram(pkt); err != nil {
-			slog.Debug("tun: datagram send failed", "component", "tun", "peer", peerName, "size", n, "error", err)
+			s.tunOversize.report("tun", n, err)
 			continue
 		}
 

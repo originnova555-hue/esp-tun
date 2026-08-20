@@ -815,9 +815,29 @@ func (c *Config) setDefaults() error {
 		c.Metrics.Listen = "127.0.0.1:9200"
 	}
 
-	// TUN defaults
-	if c.TUN.Enabled && c.TUN.MTU == 0 {
-		c.TUN.MTU = 1360
+	// TUN defaults. The MTU is derived rather than hardcoded: an inner
+	// IP packet has to fit inside one QUIC datagram, and that ceiling
+	// moves with performance.mtu. See MaxTUNMTU.
+	if c.TUN.Enabled {
+		ceiling := MaxTUNMTU(c.Performance.MTU)
+		if c.TUN.MTU == 0 {
+			c.TUN.MTU = ceiling
+		} else if c.TUN.MTU > ceiling {
+			// Clamp rather than reject. A tun.mtu above the ceiling is
+			// not a degraded tunnel, it is a black hole: small packets
+			// (ping, DNS, TCP handshakes) get through while every
+			// full-size segment is silently dropped, so the link looks
+			// up and moves zero data. Refusing to start would turn an
+			// already-broken deployment into an outage on upgrade;
+			// clamping restores traffic immediately and says so loudly.
+			slog.Warn("tun.mtu exceeds the QUIC datagram ceiling — clamping",
+				"component", "config",
+				"configured", c.TUN.MTU,
+				"clamped_to", ceiling,
+				"performance_mtu", c.Performance.MTU,
+				"hint", "set tun.mtu <= the clamped value (or omit it to derive automatically); above the ceiling only small packets pass")
+			c.TUN.MTU = ceiling
+		}
 	}
 
 	// Default inbound: if no inbounds defined in client mode, create a SOCKS5
@@ -1231,6 +1251,53 @@ func (c *Config) validateClientSpoof() []string {
 	return errs
 }
 
+// MaxTUNMTU returns the largest tun.mtu whose inner IP packets still
+// fit inside a single QUIC datagram at the given performance.mtu.
+//
+// Getting this wrong does not degrade the tunnel, it black-holes it:
+// small packets (ping, DNS, TCP handshakes) fit and pass, while every
+// full-size segment is silently dropped, so the link looks perfectly
+// healthy and carries zero throughput. The budget:
+//
+//   - quic.InitialPacketSize = performance.mtu - 31 (obfuscator framing
+//   - nonce + tag; see internal/tunnel.obfuscatorOverheadBytes, which
+//     is duplicated as a literal here to avoid a config<->tunnel import
+//     cycle).
+//   - quic-go caps a datagram payload at estimateMaxPayloadSize(pktSize)
+//     = pktSize - 1 (type byte) - 20 (max connection ID) - 16 (AEAD tag)
+//     = pktSize - 37.
+//   - We spend 1 more byte on the datagram-type prefix that separates
+//     TUN packets from UDP-relay payloads (internal/tunnel/datagram.go).
+//
+// so the scaling part is performance.mtu - 31 - 37 - 1 = mtu - 69.
+//
+// On top of that there is an absolute cap that does NOT scale with
+// performance.mtu. Measured end-to-end over a veth pair (iperf3 through
+// the tunnel, throughput drops from ~1 Gbps to exactly 0): tun.mtu=1342
+// passes and 1343 black-holes, identically at performance.mtu 1400 and
+// 1450. tunMTUAbsoluteCap sits well under that observed cliff so the
+// derived value stays safe even as quic-go's estimate shifts with
+// connection-ID length or packet-number growth.
+func MaxTUNMTU(performanceMTU int) int {
+	const (
+		obfuscatorOverhead   = 31
+		quicDatagramOverhead = 38 // quic-go's 37 + our 1-byte type prefix
+		// Conservative: the measured cliff is 1343, this leaves ~40
+		// bytes of headroom rather than sitting one byte under it.
+		tunMTUAbsoluteCap = 1300
+		// Never derive something the kernel would reject outright.
+		tunMTUFloor = 576
+	)
+	m := performanceMTU - obfuscatorOverhead - quicDatagramOverhead
+	if m > tunMTUAbsoluteCap {
+		m = tunMTUAbsoluteCap
+	}
+	if m < tunMTUFloor {
+		m = tunMTUFloor
+	}
+	return m
+}
+
 // validateTUN validates the tun{} block. No-op when tun.enabled=false.
 // In server mode, also cross-checks peers[].tun_addr: each must parse,
 // fall inside tun.local's subnet, and be disjoint across peers (it is
@@ -1265,25 +1332,15 @@ func (c *Config) validateTUN() []string {
 	if c.TUN.Queues < 0 || c.TUN.Queues > 256 {
 		errs = append(errs, fmt.Sprintf("tun.queues=%d is out of range (0=default 1, 1..256 explicit)", c.TUN.Queues))
 	}
-	// The inner IP packet plus its 1-byte datagram-type prefix (see
-	// internal/tunnel/datagram.go) must fit inside what the transport
-	// MTU can carry after obfuscator overhead — otherwise every inner
-	// packet at the TUN MTU ceiling is silently dropped rather than
-	// tunneled. Mirrors the obfuscatorOverheadBytes budget used to
-	// derive quic.InitialPacketSize from performance.mtu.
-	const (
-		datagramTypeByteOverhead = 1
-		// Mirrors internal/tunnel.obfuscatorOverheadBytes (3-byte framing
-		// + 12-byte ChaCha20-Poly1305 nonce + 16-byte auth tag = 31).
-		// Duplicated here rather than imported to avoid a config<->tunnel
-		// import cycle; internal/tunnel/conn.go asserts the same value.
-		obfuscatorOverheadBytesForValidation = 31
-	)
-	effectiveTUNCeiling := c.Performance.MTU - obfuscatorOverheadBytesForValidation - datagramTypeByteOverhead
-	if c.TUN.MTU > 0 && c.TUN.MTU > effectiveTUNCeiling {
+	// setDefaults already clamps tun.mtu down to MaxTUNMTU, so by the
+	// time validation runs an over-large value has been corrected and
+	// logged. This is a backstop for callers that build a Config
+	// programmatically and validate it without going through
+	// setDefaults.
+	if ceiling := MaxTUNMTU(c.Performance.MTU); c.TUN.MTU > 0 && c.TUN.MTU > ceiling {
 		errs = append(errs, fmt.Sprintf(
-			"tun.mtu=%d does not fit inside a QUIC datagram at performance.mtu=%d (max usable tun.mtu here is %d — either raise performance.mtu or lower tun.mtu)",
-			c.TUN.MTU, c.Performance.MTU, effectiveTUNCeiling))
+			"tun.mtu=%d does not fit inside a QUIC datagram at performance.mtu=%d (max usable tun.mtu here is %d — lower tun.mtu, or omit it to derive it automatically)",
+			c.TUN.MTU, c.Performance.MTU, ceiling))
 	}
 
 	if c.Mode == ModeServer {

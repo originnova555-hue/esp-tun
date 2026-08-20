@@ -1,28 +1,37 @@
 {
-  "_tier": "Medium — moderate VPS, 20-100 concurrent users.",
+  "_tier": "Medium \u2014 moderate VPS, 20-100 concurrent users.",
   "__usage": "Fill in SERVER_IP / SERVER_SPOOF_IP / CLIENT_SPOOF_IP / keys, then run: quiccochet -c medium-client.json",
-
   "mode": "client",
-  "transport": { "type": "udp" },
-  "listen_port": 0,
-  "server": { "address": "SERVER_IP", "port": 8080 },
-
-  "spoof": {
-    "source_ips": ["CLIENT_SPOOF_IP"],
-    "peer_spoof_ips": ["SERVER_SPOOF_IP"]
+  "transport": {
+    "type": "udp"
   },
-  "crypto": { "private_key": "", "peer_public_key": "" },
-
+  "listen_port": 0,
+  "server": {
+    "address": "SERVER_IP",
+    "port": 8080
+  },
+  "spoof": {
+    "source_ips": [
+      "CLIENT_SPOOF_IP"
+    ],
+    "peer_spoof_ips": [
+      "SERVER_SPOOF_IP"
+    ]
+  },
+  "crypto": {
+    "private_key": "",
+    "peer_public_key": ""
+  },
   "tun": {
     "enabled": true,
     "name": "qc0",
     "local": "10.20.0.2/24",
-    "mtu": 1360,
     "queues": 2,
     "pin_cores": false
   },
-
-  "obfuscation": { "mode": "none" },
+  "obfuscation": {
+    "mode": "none"
+  },
   "quic": {
     "pool_size": 4,
     "congestion_control": "auto"
@@ -31,7 +40,12 @@
     "read_buffer": 8388608,
     "write_buffer": 8388608
   },
-
-  "logging": { "level": "info", "file": "" },
-  "metrics": { "enabled": true, "listen": "127.0.0.1:9200" }
+  "logging": {
+    "level": "info",
+    "file": ""
+  },
+  "metrics": {
+    "enabled": true,
+    "listen": "127.0.0.1:9200"
+  }
 }

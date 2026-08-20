@@ -1,28 +1,37 @@
 {
-  "_tier": "Light — weak VPS, 1-20 concurrent users. Lowest CPU/RAM floor.",
+  "_tier": "Light \u2014 weak VPS, 1-20 concurrent users. Lowest CPU/RAM floor.",
   "__usage": "Fill in SERVER_IP / SERVER_SPOOF_IP / CLIENT_SPOOF_IP / keys, then run: quiccochet -c light-client.json",
-
   "mode": "client",
-  "transport": { "type": "udp" },
-  "listen_port": 0,
-  "server": { "address": "SERVER_IP", "port": 8080 },
-
-  "spoof": {
-    "source_ips": ["CLIENT_SPOOF_IP"],
-    "peer_spoof_ips": ["SERVER_SPOOF_IP"]
+  "transport": {
+    "type": "udp"
   },
-  "crypto": { "private_key": "", "peer_public_key": "" },
-
+  "listen_port": 0,
+  "server": {
+    "address": "SERVER_IP",
+    "port": 8080
+  },
+  "spoof": {
+    "source_ips": [
+      "CLIENT_SPOOF_IP"
+    ],
+    "peer_spoof_ips": [
+      "SERVER_SPOOF_IP"
+    ]
+  },
+  "crypto": {
+    "private_key": "",
+    "peer_public_key": ""
+  },
   "tun": {
     "enabled": true,
     "name": "qc0",
     "local": "10.20.0.2/24",
-    "mtu": 1360,
     "queues": 1,
     "pin_cores": false
   },
-
-  "obfuscation": { "mode": "none" },
+  "obfuscation": {
+    "mode": "none"
+  },
   "quic": {
     "pool_size": 2,
     "congestion_control": "cubic"
@@ -31,7 +40,12 @@
     "read_buffer": 4194304,
     "write_buffer": 4194304
   },
-
-  "logging": { "level": "info", "file": "" },
-  "metrics": { "enabled": false, "listen": "127.0.0.1:9200" }
+  "logging": {
+    "level": "info",
+    "file": ""
+  },
+  "metrics": {
+    "enabled": false,
+    "listen": "127.0.0.1:9200"
+  }
 }

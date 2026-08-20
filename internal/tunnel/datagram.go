@@ -1,8 +1,60 @@
 package tunnel
 
 import (
+	"errors"
 	"hash/fnv"
+	"log/slog"
+	"sync/atomic"
+	"time"
+
+	"github.com/quic-go/quic-go"
 )
+
+// oversizeReporter rate-limits the warning emitted when an inner packet
+// is too large to fit in a QUIC datagram.
+//
+// This warning exists because the failure it describes is otherwise
+// invisible and total. A tun.mtu above the datagram ceiling still
+// passes small packets — ping, DNS, TCP handshakes all succeed — while
+// every full-size segment is dropped, so the tunnel reports itself
+// healthy, the pool is up, and throughput is exactly zero. Logging that
+// at debug level (as this originally did) means the one signal that
+// explains the outage is off by default. Dropped packets can arrive at
+// line rate, hence the rate limit rather than a plain Warn per packet.
+type oversizeReporter struct {
+	lastWarnUnixNano atomic.Int64
+	suppressed       atomic.Uint64
+}
+
+// report emits at most one warning per interval, folding the number of
+// drops suppressed in between into the next line so the operator can
+// still see the scale of the loss.
+func (r *oversizeReporter) report(component string, pktSize int, err error) {
+	const interval = 30 * time.Second
+
+	var tooLarge *quic.DatagramTooLargeError
+	if !errors.As(err, &tooLarge) {
+		// Some other send failure (dead connection, closed session):
+		// stays at debug, it is expected churn rather than a
+		// misconfiguration that silently eats all real traffic.
+		slog.Debug("tun: datagram send failed", "component", component, "size", pktSize, "error", err)
+		return
+	}
+
+	now := time.Now().UnixNano()
+	last := r.lastWarnUnixNano.Load()
+	if now-last < int64(interval) || !r.lastWarnUnixNano.CompareAndSwap(last, now) {
+		r.suppressed.Add(1)
+		return
+	}
+
+	slog.Warn("inner packet too large for a QUIC datagram — dropping (tunnel will appear up but pass no full-size traffic)",
+		"component", component,
+		"packet_size", pktSize,
+		"max_datagram_payload", tooLarge.MaxDatagramPayloadSize,
+		"suppressed_since_last_warning", r.suppressed.Swap(0),
+		"hint", "lower tun.mtu (or omit it to derive it automatically) — see config.MaxTUNMTU")
+}
 
 // Every QUIC DATAGRAM frame this tunnel sends carries a 1-byte type
 // prefix so the TUN/L3 path and the legacy SOCKS5 UDP-ASSOCIATE relay
