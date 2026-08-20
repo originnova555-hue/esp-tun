@@ -4,10 +4,15 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual runs build whatever branch/ref they are dispatched on and
+  # create the version tag as part of publishing (gh release create
+  # creates a missing tag at --target). This is the path to use when
+  # pushing a tag directly is not available; it must therefore NOT try
+  # to check out the version as if it already existed.
   workflow_dispatch:
     inputs:
-      tag:
-        description: 'Existing tag to build and release (e.g. v2.1.0)'
+      version:
+        description: 'Version tag to create and release (e.g. v2.1.0)'
         required: true
         type: string
 
@@ -23,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ github.ref }}
 
       - uses: actions/setup-go@v6
         with:
@@ -57,7 +62,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ github.ref }}
 
       - uses: actions/setup-go@v6
         with:
@@ -65,7 +70,7 @@ jobs:
 
       - name: resolve version
         id: ver
-        run: echo "name=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+        run: echo "name=${{ github.event.inputs.version || github.ref_name }}" >> "$GITHUB_OUTPUT"
 
       - name: build
         env:
@@ -124,13 +129,19 @@ jobs:
       - name: checksums
         run: sha256sum quiccochet-* > checksums.txt
 
+      # --target pins the tag to the exact commit this run built. On a
+      # tag push the tag already exists and --target is ignored; on a
+      # manual dispatch it is what creates the tag, so the published
+      # binaries and the tag can never point at different commits.
       - name: create release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ github.event.inputs.tag || github.ref_name }}
+          VERSION: ${{ github.event.inputs.version || github.ref_name }}
+          TARGET_SHA: ${{ github.sha }}
         run: |
           gh release create "${VERSION}" \
             --repo "${{ github.repository }}" \
+            --target "${TARGET_SHA}" \
             --title "${VERSION}" \
             --generate-notes \
             quiccochet-* checksums.txt
