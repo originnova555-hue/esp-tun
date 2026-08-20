@@ -1,5 +1,7 @@
 # QUICochet — End-to-End Setup Tutorial
 
+> **Most people should use the interactive wizard instead of this manual walkthrough** — see the [README's Quick Start](README.md#quick-start): `bash <(curl -fsSL https://raw.githubusercontent.com/originnova555-hue/esp-tun/claude/quiccochet-tunnel-refactor-owaip5/install.sh)` builds the binary and the `spoof-tunnel` manager does everything below (keys, config, TUN, systemd unit, kernel tuning notes) through a menu. This document remains useful if you want to understand exactly what the wizard is doing, or need to set something up by hand.
+
 A concrete, copy-paste walkthrough for bringing up a QUICochet tunnel between two **Ubuntu 24.04** VPS instances. Uses the default `udp` transport (best throughput, simplest). For other transports, adjust the config as described in the [README](README.md#transport-details).
 
 ## Topology assumption

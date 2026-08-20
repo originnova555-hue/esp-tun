@@ -2,17 +2,25 @@
 
 [![Go Version](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go)](https://golang.org)
 
-**QUICochet** is a high-performance Layer 3/4 tunneling proxy with **bidirectional IP spoofing** and **QUIC transport**, designed to bypass Deep Packet Inspection (DPI) and stateful firewalls in restrictive network environments.
+**QUICochet** is a high-performance Layer 3/4 tunneling proxy with **bidirectional IP spoofing** and **QUIC transport**, designed to bypass Deep Packet Inspection (DPI) and stateful firewalls in restrictive network environments. This fork adds a full **TUN/L3 datapath**, **four performance tiers**, **multi-tunnel orchestration**, and a menu-driven **manager script** (`spoof-tunnel.sh`) on top of the original engine, aimed at running one or more production tunnels — each serving hundreds to thousands of concurrent users — reliably on boxes ranging from a cheap VPS to a dedicated server.
 
 <a id="features"></a>
 ## 🚀 Key Features
 
+**Orchestration (this fork)**
+- **One-command install**: `install.sh` builds the binary and drops you straight into the manager
+- **Menu-driven tunnel manager**: create, start/stop/restart, view logs, edit, benchmark, and remove any number of named tunnels from one script — each gets its own systemd service
+- **Four performance tiers** (Light/Medium/High/Ultra): the wizard reads the box's real core count and RAM and suggests the right one, so a weak VPS lands on conservative settings and a dedicated box lands on aggressive ones — see [Performance Tiers](#performance-tiers)
+- **TUN/L3 mode**: routes whole IP packets over a persistent TUN interface instead of a per-flow SOCKS5 relay — no per-flow fd/goroutine/route state, see [TUN / Layer-3 Mode](#tun-mode)
+- **Multi-spoof-IP management with live health**: add/remove spoof IPs from the running config, and see which ones are actually passing traffic — see [Multi-Spoof-IP Management](#multi-spoof-management)
+
+**Engine**
 - **Mutual IP Spoofing**: Both client and server forge their source IPs, leaving no traceable connection state in middleboxes
 - **QUIC Transport**: Built on `quic-go` with native stream multiplexing, encryption, and reliability
 - **Anti-DPI/anti-IA Defenses**: Packet padding, size binning, and chaffing to evade traffic analysis
-- **Connection Pooling**: Multiple QUIC connections (configurable, default: 4) for high-throughput WAN links
-- **UDP Relay**: Full SOCKS5 UDP ASSOCIATE support via QUIC datagrams — no IP leak even with outbound proxy
-- **Multi-Spoof**: Randomize outgoing source IP from a configurable pool — traffic appears to originate from N independent hosts
+- **Connection Pooling**: Multiple QUIC connections (configurable, tier-dependent) for high-throughput WAN links
+- **Two datapaths**: TUN/L3 (primary — whole-IP routing) and legacy SOCKS5 UDP ASSOCIATE (opt-in, for per-app proxying) over the same QUIC datagram channel
+- **Multi-Spoof**: Multiple outgoing source IPs per tunnel with automatic failover — traffic appears to originate from N independent hosts, and the daemon quarantines any IP that stops working
 - **IPv6 First-Class**: end-to-end v6 across all transports (`udp`, `icmp`, `raw`, `syn_udp`); the `udp` transport supports single-socket dual-stack with per-family realPeer routing and a hardened blocklist that defangs DNS-rebinding via 6to4 / Teredo / v4-compatible wrappers
 - **sendmsg + IP_TRANSPARENT**: UDP transport uses kernel-native path with per-packet source IP selection via IP_PKTINFO / IPV6_PKTINFO (v6 + dual-stack), eliminating manual header construction and enabling TX checksum offload
 - **Zero-Allocation Hot Path**: Pooled buffers and optimized cipher operations for maximum throughput
@@ -20,71 +28,199 @@
 - **Resilient Pooling**: Exponential backoff with parallel reconnect, instant recovery from restart
 - **Anti-SSRF**: Blocks private/loopback/CGNAT/link-local targets by default, with DNS rebinding protection
 - **Replay Protection**: Sliding-window bitmap filter with session-unique nonce prefix
+- **Automatic cipher selection**: AES-256-GCM on hardware with AES-NI/ARMv8 crypto extensions, ChaCha20-Poly1305 otherwise
+- **CPU core pinning**: TUN worker goroutines can be pinned to specific cores on multi-queue tiers
 - **Structured Logging**: `log/slog` with JSON output to file, text to stderr, configurable levels
-- **~1.1 Gbps single stream, 2.2+ Gbps multi-stream** throughput on LAN (see [Benchmarks](#benchmark-results))
 - **Pluggable Congestion Control**: stock CUBIC by default, optional BBR v1 (experimental)
-- **Admin Socket**: optional Unix-domain control plane for on-demand stats and in-link latency/throughput benchmarks over the live tunnel — no restart, no extra config on the server side
+- **Admin Socket**: Unix-domain control plane for on-demand stats, in-link latency/throughput benchmarks, and spoof-IP health/quarantine control over the live tunnel — no restart, no extra config on the server side
 - **Prometheus Metrics**: optional HTTP `/metrics` endpoint exposing pool health, byte counters, and aggregated QUIC packet-loss telemetry — drop-in for Prometheus / Grafana
 
 <a id="toc"></a>
 ## 📋 Table of Contents
 
 - [Key Features](#features)
+- [Quick Start](#quick-start)
+- [TUN / Layer-3 Mode](#tun-mode)
+- [Performance Tiers](#performance-tiers)
+- [Multi-Tunnel Management](#tunnel-manager)
+- [Multi-Spoof-IP Management & Health](#multi-spoof-management)
 - [Architecture](#architecture)
   - [How It Works](#how-it-works)
   - [Protocol Stack](#protocol-stack)
   - [Why QUIC?](#why-quic)
-- [Installation](#installation)
-  - [Prerequisites](#prerequisites)
-  - [Build from Source](#build-from-source)
-  - [Generate Keys](#generate-keys)
-- [Quick Start](#quick-start)
-  - [1. Configure Server](#1-configure-server)
-  - [2. Configure Client](#2-configure-client)
-  - [3. Run](#3-run)
-  - [SOCKS5 Authentication](#socks5-auth)
-- [Configuration](#configuration)
-  - **Reference**
-    - [Required Fields](#required-fields)
-    - [Config Migration (v1.x → v2.x)](#config-migration)
-  - **Transport & Spoofing**
-    - [Transport Details](#transport-details)
-    - [Multi-Spoof](#multi-spoof)
-    - [Multi-Peer (server mode)](#multi-peer)
-    - [ICMP Mode Asymmetry](#icmp-mode-asymmetry)
-    - [Spoof Tester](#spoof-tester)
-    - [Client Behind NAT (listen_port)](#client-behind-nat-listen_port)
-    - [IPv6 Deployment](#ipv6-deployment)
-    - [sendmsg + IP_TRANSPARENT](#sendmsg-ip-transparent)
-  - **Performance**
-    - [Config Knobs](#performance-tuning-config)
-    - [Packet Reorder Threshold](#packet-reorder-threshold)
-    - [Kernel Pacing (`SO_MAX_PACING_RATE`)](#kernel-pacing)
-    - [Congestion Control](#congestion-control)
-    - [UDP Relay Datagram Size](#udp-relay-datagram-size)
-    - [Scaling for Many Clients](#scaling-for-many-clients)
-    - [PMTUD and Obfuscation](#pmtud-and-obfuscation)
-  - **Security**
-    - [Private Target Blocking](#security)
-    - [Obfuscation (Anti-DPI)](#obfuscation-anti-dpi)
-    - [Outbound Proxy (server mode)](#outbound-proxy-server-mode-only)
-    - [Reverse Port Forwarding (ssh -R)](#reverse-port-forwarding)
-  - **Observability**
-    - [Admin Socket](#admin-socket)
-    - [Prometheus Metrics](#prometheus-metrics)
+- [Manual Setup & Configuration Reference](#manual-setup)
+  - [Prerequisites & Build from Source](#prerequisites)
+  - [Manual Config (no wizard)](#manual-config)
+  - [Required Fields](#required-fields)
+  - [Transport Details](#transport-details)
+  - [Multi-Spoof (schema)](#multi-spoof)
+  - [Multi-Peer (server mode)](#multi-peer)
+  - [Config Migration (v1.x → v2.x)](#config-migration)
+  - [ICMP Mode Asymmetry](#icmp-mode-asymmetry)
+  - [Spoof Tester](#spoof-tester)
+  - [Client Behind NAT (listen_port)](#client-behind-nat-listen_port)
+  - [IPv6 Deployment](#ipv6-deployment)
+  - [sendmsg + IP_TRANSPARENT](#sendmsg-ip-transparent)
+- [Performance Tuning](#performance-tuning-config)
+  - [Config Knobs](#performance-tuning-config)
+  - [Packet Reorder Threshold](#packet-reorder-threshold)
+  - [Kernel Pacing (`SO_MAX_PACING_RATE`)](#kernel-pacing)
+  - [Congestion Control](#congestion-control)
+  - [UDP Relay Datagram Size](#udp-relay-datagram-size)
+  - [Scaling for Many Clients](#scaling-for-many-clients)
+  - [PMTUD and Obfuscation](#pmtud-and-obfuscation)
+- [Security](#security)
+  - [Private Target Blocking](#security)
+  - [Obfuscation (Anti-DPI)](#obfuscation-anti-dpi)
+  - [Outbound Proxy (server mode)](#outbound-proxy-server-mode-only)
+  - [Reverse Port Forwarding (ssh -R)](#reverse-port-forwarding)
+- [Observability](#admin-socket)
+  - [Admin Socket](#admin-socket)
+  - [Prometheus Metrics](#prometheus-metrics)
 - [OS-Level Tuning](#performance-tuning-os)
   - [sysctl Configuration](#os-level-configuration)
   - [File Descriptor Limit](#file-descriptor-limit)
   - [ICMP Transport: Kernel Configuration](#icmp-transport-kernel-configuration)
 - [Benchmarks](#benchmark-results)
 - [Roadmap](#roadmap)
-  - [Complete](#complete)
-  - [Future](#future)
 - [Contributing](#contributing)
-  - [Development Setup](#development-setup)
 - [Acknowledgments](#acknowledgments)
 
-> **First time setting this up on a pair of fresh VPS?** Read [**SETUP.md**](SETUP.md) for a copy-paste walkthrough on Ubuntu 24.04 — all sysctls, systemd units, troubleshooting included.
+> **First time setting this up by hand on a pair of fresh VPS, without the wizard?** Read [**SETUP.md**](SETUP.md) for a copy-paste walkthrough on Ubuntu 24.04. Most people should use the [Quick Start](#quick-start) below instead — it does the same thing interactively.
+
+---
+
+<a id="quick-start"></a>
+## 🚀 Quick Start
+
+One machine is the **Iran-side / server** (has the real public IP everyone connects to); the other is the **Foreign-side / client** (dials out through the tunnel). Run this on both:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/originnova555-hue/esp-tun/claude/quiccochet-tunnel-refactor-owaip5/install.sh)
+```
+
+This builds `quiccochet` from source (there are no prebuilt release binaries for this fork — the installer fetches an official Go 1.25+ toolchain itself if your distro's is too old), installs it at `/opt/quiccochet/` together with the manager script and the four tier templates, links `spoof-tunnel` into your `PATH`, and — on an interactive terminal — opens the manager menu immediately. Reopen it any time with:
+
+```bash
+sudo spoof-tunnel
+```
+
+**On the server (Iran-side) box**, pick `1) Create Iran tunnel`. The wizard:
+
+1. Asks a tunnel **name** (letters/numbers/`-`/`_` only — it becomes a systemd unit name).
+2. Detects your **CPU core count and RAM** and suggests a [performance tier](#performance-tiers); accept it or pick another.
+3. Asks the **listen IP** (autodetected) and the **peer's real IP**.
+4. Asks one or more **spoof IPs**, comma-separated — see [Multi-Spoof-IP Management](#multi-spoof-management) for why more than one is worth it.
+5. Asks the UDP port and TUN settings (sensible defaults; the TUN interface name auto-increments so a second tunnel on the same box never collides with the first).
+6. Runs `quiccochet keygen` for you and shows **your public key** — copy it now, you'll need it on the other box.
+7. Asks for the **peer's public key** (format-checked — a typo or truncated paste is rejected immediately instead of failing later).
+8. Writes the config, installs and starts the systemd service.
+
+**On the client (Foreign-side) box**, pick `2) Create Foreign tunnel` and answer the same prompts — using the server's public key you just copied, and giving the server your own public key from this run in return.
+
+That's it — both services are running under systemd (`Restart=always`), and the tunnel is up. Open the tunnel's menu any time from the manager's main screen to check status, view live logs, run a benchmark, or manage spoof IPs.
+
+**Prefer to script it, or manage many boxes?** Every wizard action has a CLI form:
+
+```bash
+spoof-tunnel status                    # all tunnels on this box
+spoof-tunnel start   iran-main
+spoof-tunnel stats   iran-main         # live admin-socket snapshot
+spoof-tunnel bench   iran-main 5       # 5s latency + throughput bench over the live tunnel
+spoof-tunnel spoof-list iran-main      # spoof IPs + live health
+spoof-tunnel remove  iran-main
+spoof-tunnel help                      # full command list
+```
+
+<a id="tun-mode"></a>
+## 🧵 TUN / Layer-3 Mode
+
+The original engine relays traffic through a per-app SOCKS5 proxy: every inner TCP/UDP flow gets its own fd, goroutine, and route-table entry on both sides. Under many-small-flows load (browsers, chat apps, hundreds of concurrent users) that model dominates CPU — see [`docs/PROFILING-BASELINE.md`](docs/PROFILING-BASELINE.md) for the profile that motivated this.
+
+**TUN mode routes whole IP packets instead.** Each side opens a persistent TUN interface; packets read from it are carried as QUIC DATAGRAM frames (RFC 9221) to the other side and written to its TUN device. There is no per-inner-flow state on the tunnel's own transport layer — only the fixed QUIC connection pool and the TUN queue fds exist, regardless of how many inner TCP/UDP flows are actively multiplexed over them. Measured effect at equal flow-churn load: CPU roughly halved and fd usage went from a load-proportional burst (thousands, transient) to a small fixed footprint — see [`docs/LOADTEST-BEFORE-AFTER.md`](docs/LOADTEST-BEFORE-AFTER.md) for the full numbers and methodology.
+
+The wire format prefixes every QUIC datagram with a one-byte type tag (TUN packet vs. legacy SOCKS5-relay payload), so both datapaths share the same QUIC connection pool and can run simultaneously — enabling TUN doesn't remove the option of also listing a `socks`/`forward` inbound explicitly. It does turn off the *automatic* SOCKS5-on-127.0.0.1:1080 default that client mode otherwise falls back to when no inbound is configured, since with TUN enabled that fallback would just be an unused, unrequested open proxy.
+
+The interface itself is **persistent across reconnects**: a spoof-IP rotation or QUIC pool reconnect never tears it down and recreates it, so routes and firewall rules you layer on top of it (policy routing, `iptables`/`nftables`) stay valid.
+
+Key `tun{}` config fields (all four tier templates set these; adjust per tier or by hand):
+
+| Key | Description |
+|---|---|
+| `tun.enabled` | Turn on the TUN datapath |
+| `tun.name` | Interface name, e.g. `qc0`. The wizard auto-suggests a free `qcN` per box |
+| `tun.local` | This side's point-to-point address in CIDR form, e.g. `10.20.0.2/24` |
+| `tun.mtu` | Must leave headroom for whole IP packets inside one QUIC datagram after framing overhead — the tier templates set this correctly; don't raise it past `performance.mtu` minus obfuscator/framing overhead |
+| `tun.queues` | Parallel `IFF_MULTI_QUEUE` queues, one goroutine each. `/dev/net/tun` has no `recvmmsg` equivalent, so this — not a generic "thread count" — is what actually scales packet processing across cores; set it to your real core count on High/Ultra |
+| `tun.pin_cores` | Pin each queue's goroutine to a specific core (`runtime.LockOSThread` + `sched_setaffinity`) for cache locality on multi-queue tiers |
+| `tun.persist` | Ask the kernel to keep the interface alive independent of the fd (`TUNSETPERSIST`) |
+| `peers[].tun_addr` (server, per peer) | This peer's inner IP on the server's shared TUN subnet — the routing key the server uses to send an inbound-from-TUN packet to the right peer's QUIC session. Must fall inside `tun.local`'s subnet and be disjoint across peers |
+
+Server mode with TUN enabled serves multiple peers over **one shared TUN device**; routing is by destination IP within that subnet (`peers[].tun_addr`), not by a separate interface per peer.
+
+<a id="performance-tiers"></a>
+## ⚙️ Performance Tiers
+
+Four ready-made config pairs under [`configs/tiers/`](configs/tiers/), covering weak VPS to dedicated hardware. The manager's wizard reads `nproc` and `/proc/meminfo` and suggests the tier whose signal is weakest between the two (a high-core/low-RAM box is still treated as a weak box) — you can always override the suggestion.
+
+| Tier | Scenario | Obfuscation | `quic.pool_size` | Congestion | `tun.queues` / `pin_cores` | Buffers |
+|---|---|---|---|---|---|---|
+| **Light** | 1–20 users, weak VPS | none | 2 | cubic | 1 / off | 4 MB |
+| **Medium** | 20–100 users | none | 4 | auto (bbrv1→cubic) | 2 / off | 8 MB |
+| **High** | 100–500 users | none (switch to `standard` under active DPI) | 10 | bbrv1 | 4 / on | 24 MB |
+| **Ultra** | thousands of users, dedicated box | none | 16 | bbrv1 | 8 / on (set to your core count) | 32 MB |
+
+`obfuscation.mode` defaults to `none` on every tier, including High and Ultra: padding/chaffing is a real but secondary CPU cost (see [`docs/PROFILING-BASELINE.md`](docs/PROFILING-BASELINE.md)), so it's opt-in per the [Obfuscation](#obfuscation-anti-dpi) section rather than a tax every deployment pays regardless of whether the path is actually under DPI. `ultra`'s `performance.pacing_rate_mbps` ships at `0` (disabled) — set it once you know the box's real uplink capacity; see [Kernel Pacing](#kernel-pacing).
+
+**Both sides of a tunnel must use the same tier.** The wizard picks the template for you when creating a tunnel; the templates themselves are plain JSON if you want to hand-tune one — see [`configs/tiers/README.md`](configs/tiers/README.md) for the full field-by-field rationale.
+
+<a id="tunnel-manager"></a>
+## 🗂️ Multi-Tunnel Management — `spoof-tunnel.sh`
+
+The manager script runs any number of independently-configured, independently-managed tunnels on one box — each its own systemd service, own TUN interface, own admin socket. Configs live at `/etc/spoof-tunnel/<name>.json` (mode `0600`); the binary and tier templates live wherever `install.sh` put them (default `/opt/quiccochet/`), which the script resolves relative to its own path.
+
+Main menu lists every configured tunnel with live status; picking one opens its management menu:
+
+| # | Action |
+|---|---|
+| 1–3 | Start / Stop / Restart |
+| 4 | View logs (live, `journalctl -f`) |
+| 5 | Show config |
+| 6 | Edit config (`$EDITOR`, default `nano`) |
+| 7 | Reinstall systemd service (after a binary upgrade, or a manual config edit that changed `tun.name`/port) |
+| 8 | Auto-restart timer (periodic `systemctl restart`, off by default — see the note below) |
+| 9 | Live stats (admin socket) |
+| 10 | Benchmark (latency + throughput over the live tunnel) |
+| 11 | Manage spoof IPs (add/remove, live health) — see [Multi-Spoof-IP Management](#multi-spoof-management) |
+| 12 | Remove tunnel (service, config, private key, and TUN interface — all four, in the right order) |
+
+> **Auto-restart timer.** This is a periodic `systemctl restart`, which drops every live QUIC session — it's meant for working around a slow memory/resource drift, not as a substitute for real health monitoring. Leave it off unless you have a specific reason to want it.
+
+Every menu action has a CLI equivalent (`spoof-tunnel help` for the full list): `start`/`stop`/`restart`/`status`/`log`/`list`/`install`/`timer`/`timer-off`/`stats`/`bench`/`spoof-list`/`spoof-add`/`spoof-remove`/`spoof-resurrect`/`remove`/`keygen`.
+
+Each tunnel's systemd unit runs with `Restart=always`, `RestartSec=5s`, `StartLimitIntervalSec=0` (never gives up), and `LimitNOFILE=1048576`; `ExecStartPre` clears a stale port bind and a leftover TUN interface from a previous run before starting, so a crash-restart or a manual `systemctl restart` never gets stuck on "address already in use."
+
+<a id="multi-spoof-management"></a>
+## 🎭 Multi-Spoof-IP Management & Health
+
+A tunnel can spoof from more than one source IP (see [Multi-Spoof](#multi-spoof) for how the engine picks among them and quarantines a failing one automatically). The wizard's spoof-IP prompts accept a comma-separated list; the running config's list can be edited after the fact from either the tunnel's **Manage spoof IPs** menu (`11`) or the CLI:
+
+```bash
+spoof-tunnel spoof-list      iran-main                 # list, with live health
+spoof-tunnel spoof-add       iran-main out 203.0.113.7  # out = spoof.source_ips, in = expected-incoming
+spoof-tunnel spoof-remove    iran-main out 203.0.113.7  # refuses to drop the last remaining entry
+spoof-tunnel spoof-resurrect iran-main [ip]             # force-clear a quarantine, or all of them (Enter = all)
+```
+
+**Changes need a tunnel restart to take effect** — the running process's spoof-IP pool is built once at startup, editing the file on disk doesn't hot-reload it.
+
+**On the health column: what "healthy" actually means, and what it doesn't.** This reflects the daemon's real, cumulative send/quarantine history from live traffic on the running tunnel — not a synthetic one-off ping run on demand:
+
+- **`healthy`** — recent sends through this IP have not been blamed for a dead connection.
+- **`quarantined`** — the daemon's `SrcPool` blamed this IP for at least two consecutive dead connections and put it into an exponentially-growing cooldown (30s → 1min → 2min → … → 5min cap, automatically retried). New connections skip a quarantined IP until the cooldown clears, or until you force it early with `spoof-resurrect`.
+- **`untested`** — this IP hasn't been used to send anything yet (a freshly-added spoof IP, or a tunnel that just started). This is deliberately **not** the same as `healthy`: nothing has verified this IP works.
+
+We looked at building an active on-demand probe (send a marked packet from a specific spoof IP, confirm the peer received it, confirm the reply's own spoof IP made it back) and decided against it for this pass: the engine's IP selection is a payload-hash pick, not round-robin, so reliably exercising one specific IP on demand would need a new forced-send path *and* a new wire sub-protocol with client/server coordination — real new attack surface to get exactly right, on top of everything else here. What's shipped instead is the real telemetry the engine already collects from actual production traffic, honestly labeled — which for a tunnel that's been carrying real users for even a few minutes is arguably a stronger signal than a single synthetic ping anyway.
 
 <a id="architecture"></a>
 ## 🏗️ Architecture
@@ -103,7 +239,7 @@ Traditional VPN tunnels establish a stateful connection between fixed endpoints.
 │  Client         │                     │  Server         │
 │  Real: 10.0.0.1 │ ───Spoofed UDP───▶ │  Real: 10.0.0.2 │
 │  Spoof: 1.2.3.4 │ ◀──Spoofed UDP──── │  Spoof: 5.6.7.8 │
-│  SOCKS5: :1080  │                     │  Tunnel: :8080  │
+│  TUN: qc0       │                     │  TUN: qc0       │
 └─────────────────┘                     └─────────────────┘
 ```
 
@@ -111,17 +247,19 @@ Traditional VPN tunnels establish a stateful connection between fixed endpoints.
 
 ```
 ┌─────────────────────────────────────────┐
-│  SOCKS5 (TCP + UDP ASSOCIATE)           │  Application
+│  TUN (L3 IP packets) / SOCKS5 (legacy)  │  Application
 ├─────────────────────────────────────────┤
 │  QUIC Streams + Datagrams (TLS 1.3)     │  Transport
 ├─────────────────────────────────────────┤
 │  Obfuscated Packet (Padding + Chaff)    │  Anti-DPI
 ├─────────────────────────────────────────┤
-│  ChaCha20-Poly1305 AEAD                 │  Encryption
+│  ChaCha20-Poly1305 / AES-256-GCM AEAD   │  Encryption
 ├─────────────────────────────────────────┤
 │  UDP / ICMP / RAW / SYN+UDP (Spoofed)   │  Network
 └─────────────────────────────────────────┘
 ```
+
+The AEAD cipher for the obfuscation layer is picked automatically at startup — AES-256-GCM when the CPU has AES-NI (x86) or the ARMv8 crypto extensions, ChaCha20-Poly1305 otherwise. This is independent of Go's own TLS 1.3 cipher-suite negotiation for the QUIC handshake itself, which already auto-selects the same way.
 
 ### Why QUIC?
 
@@ -132,35 +270,31 @@ Traditional VPN tunnels establish a stateful connection between fixed endpoints.
 - ✅ **Replay protection**: Packet numbers prevent replay attacks
 - ✅ **Congestion control**: CUBIC by default, optional BBR v1 for high-RTT/lossy paths
 
-<a id="installation"></a>
-## 📦 Installation
+---
 
-### Prerequisites
+<a id="manual-setup"></a>
+## 🛠 Manual Setup & Configuration Reference
 
-- Go 1.25+ installed
-- Linux (raw sockets require Linux syscalls)
-- Root privileges or `CAP_NET_RAW` capability
+Everything below is for hand-editing a JSON config directly, or for understanding what the wizard is doing under the hood. Most people should use the [Quick Start](#quick-start) wizard instead.
 
-### Build from Source
+<a id="prerequisites"></a>
+### Prerequisites & Build from Source
+
+- Go 1.25+ (or run `install.sh`, which fetches it for you if missing)
+- Linux (raw sockets, TUN, and `IP_TRANSPARENT` all require Linux syscalls)
+- Root privileges, or the specific capabilities each transport needs (`CAP_NET_RAW`, `CAP_NET_ADMIN`)
 
 ```bash
-git clone https://github.com/PechenyeRU/quiccochet.git
-cd quiccochet
+git clone https://github.com/originnova555-hue/esp-tun.git
+cd esp-tun
 go build -ldflags "-X main.Version=$(git describe --tags --always) -X main.Commit=$(git rev-parse --short HEAD) -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o quiccochet ./cmd/quiccochet/
-```
-
-### Generate Keys
-
-```bash
 ./quiccochet keygen
 ```
 
-This generates X25519 key pairs for client and server.
+`keygen` prints an X25519 key pair to stdout by default; pass `--out-private FILE` to write the private half straight to a `0600` file instead of leaving it in your shell history/terminal scrollback (the wizard always uses this form).
 
-<a id="quick-start"></a>
-## 🚀 Quick Start
-
-### 1. Configure Server
+<a id="manual-config"></a>
+### Manual Config (no wizard)
 
 Create `server-config.json`:
 
@@ -183,6 +317,11 @@ Create `server-config.json`:
       "peer_spoof_ips": ["10.99.0.11"]
     }
   ],
+  "tun": {
+    "enabled": true,
+    "name": "qc0",
+    "local": "10.20.0.1/24"
+  },
   "performance": {
     "mtu": 1400,
     "read_buffer": 16777216,
@@ -199,11 +338,9 @@ Create `server-config.json`:
 }
 ```
 
-> **v2.0.0 break**: server mode now uses a `peers[]` array. Each peer carries its own public key, real IP, and `peer_spoof_ips`. To migrate a v1.x server config: see [config migration](#config-migration).
+> **v2.0.0 break**: server mode now uses a `peers[]` array. Each peer carries its own public key, real IP, and `peer_spoof_ips`. To migrate a v1.x server config: see [Config Migration](#config-migration).
 
-> See [`server-config.json.example`](server-config.json.example) for the full schema.
-
-### 2. Configure Client
+> See [`server-config.json.example`](server-config.json.example) for the full schema (a pre-TUN example, still valid — add a `tun{}` block per the fields in [TUN / Layer-3 Mode](#tun-mode) if you want that datapath).
 
 Create `client-config.json`:
 
@@ -220,9 +357,11 @@ Create `client-config.json`:
     "private_key": "CLIENT_PRIVATE_KEY",
     "peer_public_key": "SERVER_PUBLIC_KEY"
   },
-  "inbounds": [
-    {"type": "socks", "listen": "127.0.0.1:1080"}
-  ],
+  "tun": {
+    "enabled": true,
+    "name": "qc0",
+    "local": "10.20.0.2/24"
+  },
   "performance": {
     "mtu": 1400,
     "read_buffer": 4194304,
@@ -239,24 +378,25 @@ Create `client-config.json`:
 
 > See [`client-config.json.example`](client-config.json.example) for the full schema.
 
-### 3. Run
+Run both:
 
-**Server:**
 ```bash
 sudo ./quiccochet -c server-config.json
-```
-
-**Client:**
-```bash
 sudo ./quiccochet -c client-config.json
 ```
 
-Connect via SOCKS5: `curl --socks5 127.0.0.1:1080 https://example.com`
+With `tun.enabled=true` and no `inbounds` listed, that's the whole datapath — traffic routed at the client's TUN address reaches the server's TUN subnet. If you'd rather proxy per-app instead of (or alongside) TUN, add an explicit `socks` inbound:
+
+```json
+"inbounds": [
+  {"type": "socks", "listen": "127.0.0.1:1080"}
+]
+```
+
+then `curl --socks5 127.0.0.1:1080 https://example.com`. (A client with **no** `tun{}` block and no `inbounds` still gets the old default — a SOCKS5 listener on `127.0.0.1:1080` — for backward compatibility with pre-TUN configs; the automatic default only turns itself off when TUN is enabled, so it never doubles up as an unrequested extra listener.)
 
 <a id="socks5-auth"></a>
-### SOCKS5 Authentication (optional)
-
-Each `socks` inbound accepts an optional `auth` block (RFC 1929). When set, every SOCKS5 client must complete the username/password sub-negotiation; without it, the inbound stays in no-auth mode for backwards compatibility.
+**SOCKS5 Authentication (optional).** Each `socks` inbound accepts an optional `auth` block (RFC 1929). When set, every SOCKS5 client must complete the username/password sub-negotiation; without it, the inbound stays in no-auth mode for backwards compatibility.
 
 ```json
 "inbounds": [
@@ -268,13 +408,9 @@ Each `socks` inbound accepts an optional `auth` block (RFC 1929). When set, ever
 ]
 ```
 
-Connect with auth: `curl --socks5 alice:secret@host:1080 https://example.com`.
+Connect with auth: `curl --socks5 alice:secret@host:1080 https://example.com`. Exposing a `socks` inbound on a non-loopback address without `auth` makes you an open relay — the daemon emits a loud `slog.Warn` at startup in that case.
 
-> Exposing a `socks` inbound on a non-loopback address without `auth` makes you an open relay — the daemon emits a loud `slog.Warn` at startup in that case.
-
-<a id="configuration"></a>
-## ⚙️ Configuration
-
+<a id="required-fields"></a>
 ### Required Fields
 
 | Key | Description |
@@ -288,7 +424,9 @@ Connect with auth: `curl --socks5 alice:secret@host:1080 https://example.com`.
 | `listen_port` (server only) | Port where the server listens for tunnel traffic |
 | `server.address`, `server.port` (client only) | Real IP/port of the server |
 | `peers[]` (server only) | List of authorized clients. Each entry needs `name`, `peer_public_key`, `client_real_ip`/`client_real_ipv6`, `peer_spoof_ips` — see [Multi-Peer](#multi-peer) |
+| `tun.name`, `tun.local` (when `tun.enabled=true`) | See [TUN / Layer-3 Mode](#tun-mode) |
 
+<a id="transport-details"></a>
 ### Transport Details
 
 | Type | When to use | Extra fields |
@@ -299,9 +437,12 @@ Connect with auth: `curl --socks5 alice:secret@host:1080 https://example.com`.
 | `raw` | Deep stealth with a custom IP protocol | `transport.protocol_number`: **required**, 1–255, unused protocols like `253`/`254` work well |
 | `syn_udp` | DPI evasion via asymmetric path | — (client sends TCP SYN, server replies with raw UDP) |
 
-### Multi-Spoof
+> **GSO/GRO note**: only the `udp` transport gets quic-go's batched send/receive path (a real `*net.UDPConn` exposed via `SyscallConn`). `raw`/`icmp`/`syn_udp` fall back to one `ReadFrom()` per packet, since `SOCK_RAW` can't expose CMSG/OOB data for `UDP_GRO`/ECN — measured roughly 1.2 Gbps vs. 2.2 Gbps multi-stream ceiling as a result. Factor this into transport choice when the DPI-evasion benefit of a non-UDP transport isn't strictly needed.
 
-By default QUICochet spoofs a single source IP on every outgoing packet. **Multi-spoof** lets you specify a list of source IPs — each packet randomly selects one, making the traffic appear to originate from N independent hosts. This hardens against traffic analysis and per-flow fingerprinting by middleboxes.
+<a id="multi-spoof"></a>
+### Multi-Spoof (schema)
+
+By default QUICochet spoofs a single source IP on every outgoing packet. **Multi-spoof** lets you specify a list of source IPs — each packet selects one by a payload hash, making the traffic appear to originate from N independent hosts and giving automatic failover if one gets blocked. The [manager script's spoof-IP menu](#multi-spoof-management) is the easiest way to manage this list on a running tunnel; the raw schema:
 
 ```jsonc
 // client config
@@ -331,12 +472,12 @@ By default QUICochet spoofs a single source IP on every outgoing packet. **Multi
 - The `raw`, `icmp`, `icmpv6`, and `syn_udp` transports filter incoming packets by `peer_spoof_ips` — packets from unknown sources are silently dropped. The `udp` transport does not filter at the transport layer (kernel delivers everything to the bound port). On a hostile network where you may receive scan/probe traffic, **always set `peer_spoof_ips`** even on `udp`: without it any host that can reach your listen port will burn server CPU on AEAD-decrypt-fail, and the replay bitmap absorbs noise.
 - All listed IPs must be routable on the wire (i.e. your ISP/upstream does not block spoofed sources for those ranges). Use IP ranges you control or that are not allocated on the path. Validate with the [spoof-tester](#spoof-tester) before deploying.
 
-**Runtime IP health-check (v1.18+):** every spoof source IP is tracked at runtime by the daemon's `SrcPool`. When a QUIC connection in the pool dies, the IP whose recent send activity has gone stale gets a strike; after two consecutive strikes the IP is quarantined for an exponentially-growing cooldown (30s → 1min → 2min → … → 5min cap). Quarantined IPs are skipped by `Pick*` so new connections immediately pin to a healthy IP without operator intervention. Min-healthy guard prevents quarantining the last remaining active IP. Per-IP state is exposed via `quiccochet_spoof_ip_*` Prometheus metrics and the admin socket `stats` JSON.
+**Runtime IP health-check.** Every spoof source IP is tracked at runtime by the daemon's `SrcPool`. When a QUIC connection in the pool dies, the IP whose recent send activity has gone stale gets a strike; after two consecutive strikes the IP is quarantined for an exponentially-growing cooldown (30s → 1min → 2min → … → 5min cap). Quarantined IPs are skipped by `Pick*` so new connections immediately pin to a healthy IP without operator intervention. Min-healthy guard prevents quarantining the last remaining active IP. Per-IP state is exposed via `quiccochet_spoof_ip_*` Prometheus metrics, the `admin stats` JSON/human output (see [Admin Socket](#admin-socket)), the manager's [spoof-IP menu](#multi-spoof-management), and can be force-cleared early with `admin srcpool resurrect [ip]`.
 
 <a id="multi-peer"></a>
 ### Multi-Peer (server mode)
 
-A v2.0.0 server can serve N independent clients, each with its own X25519 keypair, real IP, and spoof set. The schema lists peers under `peers[]`:
+A server can serve N independent clients, each with its own X25519 keypair, real IP, and spoof set. The schema lists peers under `peers[]`:
 
 ```jsonc
 {
@@ -364,9 +505,9 @@ A v2.0.0 server can serve N independent clients, each with its own X25519 keypai
 }
 ```
 
-**Routing model:** inbound packets are dispatched to the right peer's cipher by their wire source IP. The `peer_spoof_ips` of every peer must be **disjoint** across the whole list — overlap would make dispatch ambiguous and the validator hard-fails. Source-IP routing is a hint only; AEAD with the per-peer key is the actual auth gate. A spoofed packet from peer A's IPs encrypted with the wrong key is dropped at decrypt-time.
+**Routing model:** inbound packets are dispatched to the right peer's cipher by their wire source IP. The `peer_spoof_ips` of every peer must be **disjoint** across the whole list — overlap would make dispatch ambiguous and the validator hard-fails. Source-IP routing is a hint only; AEAD with the per-peer key is the actual auth gate. A spoofed packet from peer A's IPs encrypted with the wrong key is dropped at decrypt-time. With TUN enabled, `peers[].tun_addr` (each peer's inner IP on the shared TUN subnet) is the *additional* routing key used for inbound-from-TUN packets — see [TUN / Layer-3 Mode](#tun-mode).
 
-**Each peer needs its own keypair.** Generate N pairs with `./quiccochet keygen` and stamp the public side into `peers[].peer_public_key`.
+**Each peer needs its own keypair.** Generate N pairs with `./quiccochet keygen` and stamp the public side into `peers[].peer_public_key`. (The manager script only ever wires up a single peer per tunnel today — for a real multi-peer server, hand-edit the config's `peers[]` array after creating the tunnel with the wizard, or maintain it by hand from the start.)
 
 <a id="config-migration"></a>
 ### Config Migration (v1.x → v2.x)
@@ -478,13 +619,90 @@ Set `listen_port` on the client to bind to a fixed port, then configure your rou
 
 If the client has a direct public IP (no NAT), leave `listen_port` at `0` (dynamic).
 
-<a id="performance-tuning-config"></a>
-### Performance Tuning (config knobs)
+<a id="ipv6-deployment"></a>
+### IPv6 Deployment
 
-The defaults below are sized to saturate realistic WAN links end-to-end, including RTTs up to ~300 ms, without any manual tuning. The socket buffer path auto-escalates via `SO_*BUFFORCE` on root-run tunnels (the normal case), so no `sysctl` is required unless you run unprivileged.
+QUICochet supports IPv6 end-to-end across the `udp`, `icmp`, `raw`, and `syn_udp` transports. The same mutual-spoof model applies: `source_ipv6s` is the list of v6 addresses inserted into the IP header on send, and `peer_spoof_ipv6s` is the receive-side filter that drops packets from any other v6 source. Inner-v6 (tunnelling traffic to a v6 destination) works on top of any outer transport — SOCKS5 ATYP=v6 is wired both for TCP CONNECT and UDP ASSOCIATE.
+
+Single-stack v6 (client side):
+
+```jsonc
+{
+  "spoof": {
+    "source_ipv6s":     ["2a01:4f9:c012:abc::10"],
+    "peer_spoof_ipv6s": ["2a01:4f9:c012:abc::20"]
+  }
+  // ...
+}
+```
+
+Server side, the same v6 fields move into the per-peer entry:
+
+```jsonc
+"peers": [
+  {
+    "name": "vpn1",
+    "peer_public_key": "...",
+    "client_real_ipv6": "2a01:4f9:c012:abc::30",
+    "peer_spoof_ipv6s": ["2a01:4f9:c012:abc::10"]
+  }
+]
+```
+
+Dual-stack `udp` transport (the only transport with single-socket dual-stack today; others need separate v4/v6 deployments). Client side:
+
+```jsonc
+{
+  "spoof": {
+    "source_ips":       ["10.0.0.10"],
+    "peer_spoof_ips":   ["10.0.0.20"],
+    "source_ipv6s":     ["2a01:4f9:c012:abc::10"],
+    "peer_spoof_ipv6s": ["2a01:4f9:c012:abc::20"]
+  }
+  // ...
+}
+```
+
+Server-side dual-stack: each peer carries both `client_real_ip` and `client_real_ipv6`, plus the v4 and v6 spoof lists.
+
+When both families are configured the `udp` transport binds a single socket on `[::]:port` with `IPV6_V6ONLY=0` so v4 (via the `::ffff:` mapped form) and native v6 land on the same recv loop. Outbound packets are routed to the matching `realPeer` slot per family — a v4 client and a v6 client connecting to the same dual-stack server each maintain their own learned ephemeral port without crossing.
+
+**Caveats:**
+
+- **Symmetric peer-spoof in dual-stack**: if you set `peer_spoof_ips` you MUST also set `peer_spoof_ipv6s`, and vice versa. An asymmetric filter would silently leave the unfiltered family open to off-path UDP injection. The transport refuses to start when this is misconfigured.
+- **`syn_udp` is single-stack**: configure `source_ips` OR `source_ipv6s`, not both. Dual-stack `syn_udp` would need parallel raw-socket recv loops on disjoint v4/v6 sockets — tracked but not yet implemented.
+- **`syn_udp` v6 needs `IPV6_TRANSPARENT`** (CAP_NET_ADMIN). The kernel builds the v6 IP header itself; we override the source via `IPV6_PKTINFO` cmsg per packet, which only works when the socket has `IPV6_TRANSPARENT` set.
+- **uRPF on v6 transit**: some hosting providers and middle-boxes enforce strict source-address validation on IPv6 (more common than on v4). Spoofed v6 source IPs may be silently dropped on some uplinks. Verify with `tcpdump` on the egress interface before assuming a quiet failure is a code bug.
+- **Hardened blocklist**: cloud-metadata endpoints (`fd00:ec2::254` for AWS, `fd00:c1:c0:1::1` for Oracle, …) and exotic v6 prefixes that wrap or tunnel a v4 destination (Teredo `2001::/32`, 6to4 `2002::/16`, deprecated v4-compatible `::/96`, RFC 3879 site-local `fec0::/10`, RFC 6666 discard `100::/64`) are unconditionally rejected when `block_private_targets=true` — this defangs DNS-rebinding attacks that try to reach the server's internal network through a v6 wrapper.
+- **Hetzner / DO / GCP** allocate a `/64` per instance by default; pick a few addresses inside that block for `source_ipv6s` multi-spoof. The allocation is verified by `ip -6 addr show`.
+
+<a id="sendmsg-ip-transparent"></a>
+### sendmsg + IP_TRANSPARENT (UDP transport)
+
+When using the `udp` transport, QUICochet automatically probes for `IP_TRANSPARENT` (or `IPV6_TRANSPARENT` on v6 / dual-stack) support on the receive socket. If available (Linux kernel ≥ 2.6.28, CAP_NET_RAW + CAP_NET_ADMIN — both already required), the send path switches from raw sockets with manual IP/UDP header construction to `sendmsg(2)` with `IP_PKTINFO` / `IPV6_PKTINFO` cmsg for per-packet source IP selection. This gives:
+
+- **No manual headers**: the kernel builds IP + UDP headers, freeing ~300 ns/pkt of CPU
+- **TX checksum offload**: the kernel delegates IP/UDP checksum to the NIC if supported, further reducing CPU in the hot path
+- **Multi-spoof integration**: the selected source IP is set via `ipi_spec_dst` (v4) or `ipi6_addr` (v6) in the cmsg — no per-IP checksum recomputation
+- **Cleaner socket model**: a single `SOCK_DGRAM` fd handles both send and receive (the separate `SOCK_RAW` + `IP_HDRINCL` fd is closed)
+
+If the probe fails (e.g. missing capability or very old kernel), the transport silently falls back to the raw socket path with full backward compatibility. The mode is logged at startup:
+
+```
+INFO  udp transport: sendmsg mode enabled  component=transport  v6_socket=false  dual_stack=false
+```
+
+The `raw`, `icmp`, and `syn_udp` transports are unaffected — they need `IP_HDRINCL` for protocol-level tricks that `SOCK_DGRAM` cannot express.
+
+---
+
+<a id="performance-tuning-config"></a>
+## 📈 Performance Tuning
+
+The defaults below are sized to saturate realistic WAN links end-to-end, including RTTs up to ~300 ms, without any manual tuning. The socket buffer path auto-escalates via `SO_*BUFFORCE` on root-run tunnels (the normal case), so no `sysctl` is required unless you run unprivileged. The [tier templates](#performance-tiers) set most of these for you — this is the field-by-field reference for hand-tuning.
 
 | Key | Default | Description |
-|-----|---------|-------------|
+|-----|---------|--------------|
 | `performance.mtu` | `1400` | On-wire payload budget (post-obfuscator, pre-IP). **Minimum `1231`**, safe max `~1460` for eth. Drives `quic.InitialPacketSize` automatically |
 | `performance.read_buffer` | `33554432` (32 MB) | `SO_RCVBUF` target. Applied via `SO_RCVBUFFORCE` with graceful fallback — no sysctl needed when running as root |
 | `performance.write_buffer` | `33554432` (32 MB) | `SO_SNDBUF` target, same auto-escalation as read_buffer |
@@ -497,13 +715,14 @@ The defaults below are sized to saturate realistic WAN links end-to-end, includi
 | `quic.max_connection_receive_window` | `134217728` (128 MB) | Per-connection flow-control cap |
 | `quic.stream_close_timeout_sec` | `10` | Force-cancel a stream if the second copy direction hasn't drained within this window |
 | `quic.congestion_control` | `"auto"` | `"auto"` (default, BBRv1 with CUBIC fallback), `"cubic"`, or `"bbrv1"`. See [Congestion Control](#congestion-control) — BBR is ~90× better than CUBIC on 1% loss paths |
-| `quic.packet_threshold` | `1024` | Packet-reorder threshold for fast loss detection. See [Packet Reorder Threshold](#packet-reorder-threshold). RFC 9002 default is 3; we raise it to 128 to survive Go-scheduler burst + WAN jitter. |
+| `quic.packet_threshold` | `128` | Packet-reorder threshold for fast loss detection. See [Packet Reorder Threshold](#packet-reorder-threshold). RFC 9002 default is 3; we raise it to survive Go-scheduler burst + WAN jitter. |
 | `quic.max_incoming_streams` | `100000` | Hard cap on concurrent bidirectional QUIC streams **per connection**. See [Scaling for Many Clients](#scaling-for-many-clients) |
 | `quic.max_incoming_uni_streams` | `1000` | Same for unidirectional streams (unused today, reserved) |
 | `quic.max_concurrent_sessions` | `1000` | Hard cap on concurrent QUIC sessions accepted by the server. Over-cap connections are closed immediately to drain QUIC state. `0` = unlimited |
 | `quic.enable_path_mtu_discovery` | `false` | Incompatible with the obfuscator padding strategy. See [PMTUD and obfuscation](#pmtud-and-obfuscation) |
 | `quic.udp_route_idle_sec` | `90` | Idle timeout for a per-target UDP relay route on the server (measured bidirectionally) |
 | `quic.udp_route_max` | `50000` | Hard circuit-breaker on the number of concurrent UDP relay routes per session. LRU-evicts when hit |
+| `tun.queues`, `tun.pin_cores` | — | See [TUN / Layer-3 Mode](#tun-mode) — the actual "worker/thread count" knob when TUN is the datapath |
 
 **Initial receive windows (hardcoded, no knob).** QUICochet sets `InitialStreamReceiveWindow = 2 MB` and `InitialConnectionReceiveWindow = 4 MB` on every connection. quic-go's defaults (512 KB each) forced short-lived streams to crawl for 3-5 RTTs of slow-ramp before reaching useful throughput, which was the dominant perf killer on high-RTT paths. These are intentionally not exposed as config fields — they're safe on any modern host and a knob here only invites misconfiguration.
 
@@ -513,7 +732,7 @@ The defaults below are sized to saturate realistic WAN links end-to-end, includi
 
 Real-world WAN paths reorder packets. Even low µs-level inter-packet jitter combined with the way user-space QUIC senders emit packets in short bursts (Go scheduler wake-ups flush dozens of packets in microseconds) routinely produces 30+ position reorder bursts. RFC 9002 §6.1.1 sets quic-go's packet-threshold loss detector at **3**: after 3 later packets are acknowledged, the older one is declared lost and cwnd halves. Under our measured conditions this fires **continuously and falsely** on a perfectly healthy path — every spurious-loss triggers a cwnd collapse, which is why vanilla QUIC tunnels plateau at 5–10% of link capacity on paths above ~50 ms RTT.
 
-We ship a patched quic-go fork at `third_party/quic-go` that makes this threshold tunable (upstream it's a hardcoded const), and default it to **1024**. Time-threshold loss detection (9/8 × RTT) remains the primary safety net — it's jitter-proof by construction — so real loss is still caught, just ~130 ms later in the worst case.
+We ship a patched quic-go fork at `third_party/quic-go` that makes this threshold tunable (upstream it's a hardcoded const), defaulting to **128**. Time-threshold loss detection (9/8 × RTT) remains the primary safety net — it's jitter-proof by construction — so real loss is still caught, just ~130 ms later in the worst case.
 
 **Why 128?** We measured on netem 115 ms RTT + 1 ms jitter (4 streams) across several threshold values; 128 is the sweet spot between tolerating jitter-induced reorder and recovering quickly from real loss:
 
@@ -576,19 +795,19 @@ Three modes are selectable via `quic.congestion_control`:
 BBR models bandwidth explicitly instead of reacting to loss, so its throughput stays nearly path-capacity even when the link has real loss. CUBIC halves cwnd per loss event and on any lossy path collapses to a fraction of capacity. On clean paths BBR is slightly better too (1.3×) thanks to better window recovery.
 
 Caveats:
-- BBR is more aggressive than CUBIC on contention — on shared-tenancy links with competing TCP, BBR may take more than its fair share. Prefer `"cubic"` if fairness matters more than throughput.
+- BBR is more aggressive than CUBIC on contention — on shared-tenancy links with competing TCP, BBR may take more than its fair share. Prefer `"cubic"` if fairness matters more than throughput (this is why the Light tier defaults to `cubic`).
 - `"auto"` is chosen so BBR breakage (experimental fork) degrades gracefully to CUBIC rather than crashing.
 - The BBR/CUBIC choice is **local** to each endpoint — client and server can run different CCs.
 
 ### UDP Relay Datagram Size
 
-The SOCKS5 UDP ASSOCIATE relay ships each UDP packet inside a single QUIC DATAGRAM frame (RFC 9221), which is bounded by `InitialPacketSize - ~29 bytes` of QUIC overhead. With the default MTU `1400` that ceiling is **~1340 bytes** of UDP payload. Packets above that — e.g. near-MTU DNS responses or games using full 1472-byte payloads — are dropped at send time with a debug log. This is a protocol-level constraint of QUIC datagrams on an eth-MTU path, not a bug.
+The legacy SOCKS5 UDP ASSOCIATE relay ships each UDP packet inside a single QUIC DATAGRAM frame (RFC 9221), which is bounded by `InitialPacketSize - ~29 bytes` of QUIC overhead (TUN-mode packets share the same ceiling, one byte less for the datagram-type tag). With the default MTU `1400` that ceiling is **~1340 bytes** of payload. Packets above that — e.g. near-MTU DNS responses or games using full 1472-byte payloads — are dropped at send time with a debug log. This is a protocol-level constraint of QUIC datagrams on an eth-MTU path, not a bug.
 
-If your uplink supports a larger frame, raise `performance.mtu` (everything downstream — `InitialPacketSize`, the obfuscator padding target, the transport write size — is derived from this single value; there is no secondary cap to touch). For a 1500-byte eth MTU, `1472` is the safe ceiling (1500 − 20 IP − 8 UDP).
+If your uplink supports a larger frame, raise `performance.mtu` (everything downstream — `InitialPacketSize`, the obfuscator padding target, the transport write size, and the TUN interface's own MTU — is derived from this single value; there is no secondary cap to touch). For a 1500-byte eth MTU, `1472` is the safe ceiling (1500 − 20 IP − 8 UDP).
 
 ### Scaling for Many Clients
 
-QUICochet is designed to front-end a fan-in proxy (e.g. an `xray` or `sing-box` SOCKS5 server) serving hundreds or thousands of concurrent end-users through a single tunnel. Two previous hard limits have been lifted for this case:
+QUICochet is designed to serve hundreds or thousands of concurrent end-users through a single tunnel — either via TUN/L3 (recommended, see [TUN / Layer-3 Mode](#tun-mode)) or by front-ending a fan-in proxy (e.g. an `xray` or `sing-box` SOCKS5 server) over the legacy relay. Several hard limits have been lifted for this case:
 
 **1. QUIC stream cap.** quic-go's upstream default for `MaxIncomingStreams` is `100` per connection. With `pool_size = 4` that's 400 concurrent streams *globally* — saturated in seconds under fan-in load, after which every new `OpenStreamSync` blocks on `MAX_STREAMS` credit and times out at 5 s. The visible symptom is "0 kbps or 100 Mbps": downloads stall until an old stream closes, then burst until the cap is re-hit.
 
@@ -596,7 +815,7 @@ QUICochet defaults `quic.max_incoming_streams` to **100000** per connection. qui
 
 The knob **must match on client and server** — the smaller of the two wins, since `MAX_STREAMS` is a peer-advertised transport parameter.
 
-**2. UDP relay route lifecycle.** Each target of a SOCKS5 UDP ASSOCIATE flow becomes a per-target route on the server: one `net.UDPConn`, one goroutine, one fd. Browsers open 20–50 such routes per tab per minute (DNS + QUIC + WebRTC). A naive 5-minute fixed read deadline on the receive loop leaked fds and produced periodic cleanup stalls.
+**2. UDP relay route lifecycle** (legacy SOCKS5-relay datapath only — TUN mode has no per-target route at all, see [TUN / Layer-3 Mode](#tun-mode)). Each target of a SOCKS5 UDP ASSOCIATE flow becomes a per-target route on the server: one `net.UDPConn`, one goroutine, one fd. Browsers open 20–50 such routes per tab per minute (DNS + QUIC + WebRTC). A naive fixed read deadline on the receive loop leaks fds and produces periodic cleanup stalls.
 
 The current design enforces **bidirectional idle tracking**: every datagram in either direction (client→target send and target→client receive) touches a per-route `lastActivity` atomic. The receive loop wakes on a short tick (≈ `udp_route_idle_sec / 3`), checks real idle age against `udp_route_idle_sec`, and only closes on true silence. A background janitor (one goroutine per session, 30 s tick) sweeps the map as a safety net for routes stuck in the kernel. A hard LRU circuit breaker at `udp_route_max` routes per session catches runaway growth.
 
@@ -608,7 +827,7 @@ Defaults:
 | `quic.udp_route_idle_sec` | 90 s | Long enough for keepalive-heavy protocols (QUIC, WebRTC) |
 | `quic.udp_route_max` | 50000 | Each route = 1 fd; `LimitNOFILE` in the systemd unit is 1048576 |
 
-The periodic stats line exposes live counters for capacity monitoring:
+The periodic stats line, and the [admin socket](#admin-socket)'s `stats`, expose live counters for capacity monitoring:
 
 ```
 server stats  active_sessions=12 bytes_sent=... bytes_received=... open_fds=...
@@ -619,15 +838,19 @@ server stats  active_sessions=12 bytes_sent=... bytes_received=... open_fds=...
 - `udp_evictions` — lifetime LRU evictions (non-zero means you're hitting `udp_route_max` and should raise it)
 - `udp_idle_closed` — lifetime idle-triggered closes (expected to grow steadily under normal churn)
 
-Set `logging.statistics: true` to promote this line from DEBUG to INFO (so you don't need `log_level=debug` just to watch it). The same snapshot is available on demand via the [Admin Socket](#admin-socket).
+Set `logging.statistics: true` to promote this line from DEBUG to INFO (so you don't need `log_level=debug` just to watch it).
 
-**OS-level knobs.** For sustained fan-in loads also raise `net.core.somaxconn` and `LimitNOFILE` (already set to 1048576 in the systemd unit — see [ops docs](SETUP.md)). For ≥ 500 concurrent users, `pool_size: 12–16` on the client is recommended to parallelize `AcceptStream` across more quic-go dispatch loops.
+**OS-level knobs.** For sustained fan-in loads also raise `net.core.somaxconn` (see [OS-Level Tuning](#os-level-configuration)); `LimitNOFILE=1048576` is already set on every tunnel's systemd unit by the manager script. For ≥ 500 concurrent users on the legacy relay datapath, `pool_size: 12–16` on the client is recommended to parallelize `AcceptStream` across more quic-go dispatch loops (the [Ultra tier](#performance-tiers) already sets 16).
 
 ### PMTUD and obfuscation
 
 `quic.enable_path_mtu_discovery` is **off by default** and is architecturally incompatible with the obfuscator for any mode other than `"none"`. The obfuscator pads every outgoing packet to exactly `performance.mtu` bytes regardless of the QUIC packet's logical size — that is the core of the traffic-analysis resistance. PLPMTUD works by *varying* probe sizes and observing which arrive; with fixed-size padding it has no signal, and a probe larger than the target would leak a non-constant packet size, defeating the obfuscation. Set `performance.mtu` manually to match your physical path instead.
 
+---
+
 <a id="security"></a>
+## 🔒 Security
+
 ### Private Target Blocking
 
 | Section | Key | Default | Description |
@@ -652,19 +875,78 @@ Domain targets are resolved once and the resolved IP is validated before dialing
 | `obfuscation.chaffing_interval_ms` | 50 | Idle-gap chaff interval in ms (paranoid mode); minimum 5 |
 
 **Modes:**
-- `"none"`: No obfuscation (pure QUIC)
+- `"none"`: No obfuscation (pure QUIC) — every [tier template's](#performance-tiers) default
 - `"standard"`: Padding + size binning
 - `"paranoid"`: All defenses + idle-gap chaffing — sends dummy packets at jittered intervals when no real traffic is flowing
 
-> **Throughput cost**: `standard` and `paranoid` pad every packet to the configured MTU before encryption. A small ACK (~40 B) becomes a full ~1400 B on wire, inflating the physical link usage 2–4× relative to user payload. This is the price of traffic-analysis resistance. On uncensored paths where DPI isn't a concern, set `"mode": "none"` to recover the full throughput headroom.
+> **Throughput cost**: `standard` and `paranoid` pad every packet to the configured MTU before encryption. A small ACK (~40 B) becomes a full ~1400 B on wire, inflating the physical link usage 2–4× relative to user payload. This is the price of traffic-analysis resistance. On uncensored paths where DPI isn't a concern, leave `"mode": "none"` (the default on every tier) to recover the full throughput headroom.
 
 > **Fixed on-wire size**: plaintexts are rounded to one of two fixed buckets — `MTU − AEAD overhead` (tier 1, ~99% of packets) and `2 × tier-1` (tier 2, rare coalesced packets). Anything larger is dropped to keep the on-wire size invariant strict; the daemon counts these in `oversize_drops` and emits a rate-limited `slog.Warn` so you can spot a misbehaving upstream path.
 
 > **Honest framing of `paranoid` mode**: this is a *rate floor*, not strict CBR. Chaff fills idle gaps to suppress trivial active/idle inference, but it is suppressed while real traffic is flowing. A determined observer running spectral analysis on inter-arrival times can still distinguish active flow from idle on a long enough sample. The on-wire packet **size** is constant (two-bucket invariant above); the **rate** is bounded below, not held flat. Bypassing DPI on hostile networks is well within reach; resisting a global passive observer doing traffic correlation is not the design goal of this mode.
 
+### Outbound Proxy (server mode only)
+
+The server can forward all tunneled traffic through an upstream SOCKS5 proxy (e.g. a local `sing-box`/`xray` instance). This is useful when the server's IP itself is blocked from reaching the final targets and needs a second hop, or when you want to layer a separate censorship-evasion stack.
+
+| Key | Description |
+|-----|-------------|
+| `outbound_proxy.enabled` | `true` to route TCP streams and UDP datagrams through the upstream proxy |
+| `outbound_proxy.type` | Currently only `"socks5"` |
+| `outbound_proxy.address` | `host:port` of the upstream proxy |
+| `outbound_proxy.username`, `outbound_proxy.password` | Optional RFC 1929 auth |
+
+When enabled, the server skips its own DNS resolution for the final TCP dial and lets the proxy do it (preventing DNS leaks of the final target from the server's network). UDP ASSOCIATE is used for datagrams — the relay keeps a per-flow TCP control channel to the upstream proxy with a 2-minute idle timeout to prevent fd accumulation.
+
+The private-target guard `security.block_private_targets` (default `true`) rejects RFC 1918 / ULA / link-local destinations supplied as IP literals on both direct and proxy paths. In proxy mode hostnames are forwarded verbatim to the upstream proxy — DNS resolution is delegated to the proxy so the server never queries its own resolver, which would leak every client lookup to the host's local DNS.
+
+Cloud metadata endpoints (`169.254.169.254`, `metadata.google.internal`, `100.100.100.200`, `fd00:ec2::254`, …) are **always** blocked regardless of `block_private_targets`, because they only ever serve secrets and have no legitimate proxy use case.
+
+<a id="reverse-port-forwarding"></a>
+### Reverse Port Forwarding (ssh -R)
+
+Expose a port on the **server** that tunnels back to a service reachable by the **client** — the mirror image of a `forward` inbound (which listens on the client and dials on the server). Equivalent to `ssh -R`: a connection to `server:PORT` is spliced over the existing QUIC link to the named peer, which dials the configured target on its own host. The [manager wizard](#tunnel-manager) offers to set up one or more of these rules when creating a server-mode tunnel.
+
+**Server** declares one or more `reverse_forwards` rules:
+
+```json
+"reverse_forwards": [
+  { "listen": "0.0.0.0:8443", "peer": "laptop", "target": "127.0.0.1:8443" }
+]
+```
+
+| Key | Description |
+|-----|-------------|
+| `listen` | Server bind address. `host:port`, `:port`, or a bare `port`. Must be unique across rules. |
+| `peer` | Which `peers[].name` receives these connections. Connections are dropped while that peer is offline. |
+| `target` | Client-local address the peer dials. Optional — defaults to `127.0.0.1:<listen-port>`. |
+
+A `listen` without an explicit host (`:8443` or `8443`) binds to **loopback** `127.0.0.1` and logs a notice at startup — set an explicit host such as `0.0.0.0:8443` to expose it publicly (ssh `GatewayPorts=no` parity).
+
+**Client** gates which targets the server may ask it to dial with a default-deny allow list:
+
+```json
+"reverse_accept": {
+  "enabled": true,
+  "allow": ["127.0.0.1:8443"]
+}
+```
+
+| Key | Description |
+|-----|-------------|
+| `enabled` | Master switch. When `false` (default) every reverse connection is refused. |
+| `allow` | Authorised targets. `host:port` matches that exact address; a bare `host` matches any port on that host. |
+
+The client refuses any target not on the list, so the server can never coerce it into dialing an arbitrary address.
+
+---
+
+<a id="admin-socket"></a>
+## 📡 Observability
+
 ### Admin Socket
 
-The admin socket is an opt-in Unix-domain control plane for a running daemon. When enabled, a sibling CLI (`quiccochet admin`) can fetch live stats and run in-link benchmarks without touching the config or restarting anything.
+The admin socket is an opt-in Unix-domain control plane for a running daemon. Every [tier template](#performance-tiers) enables it and points at `/run/spoof-tunnel-<name>.sock` when created through the wizard. When enabled, a sibling CLI (`quiccochet admin`, or the manager's own `spoof-tunnel stats|bench|spoof-*` wrappers) can fetch live stats, run in-link benchmarks, and manage the spoof-IP pool — without touching the config or restarting anything.
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -679,12 +961,23 @@ The admin socket is an opt-in Unix-domain control plane for a running daemon. Wh
 
 The socket is created with mode `0600` and unlinked on clean shutdown. If the path is already bound by another live daemon, startup fails cleanly rather than silently unlinking.
 
-**Commands.** All subcommands take `-s/--socket` (overrides the config) and `-H/--human` (compact one-line format, default is raw JSON):
+**Commands.** All subcommands take `-s/--socket` (overrides the config) and `-H/--human` (compact format, default is raw JSON):
 
 ```bash
-# Live snapshot — pool health, bytes, UDP routes, fds, uptime
+# Live snapshot — pool health, bytes, UDP routes, fds, uptime, and (client role)
+# a per-spoof-IP health breakdown when the transport runs a SrcPool
 quiccochet admin stats -c client-config.json -H
-# ▶ pool 4/4  sent 73 B  recv 0 B  udp_assocs 0  fds 11  up 26s
+# ▶ pool 4/4  sent 73 B  recv 0 B  loss 0/27 (0%)  udp_assocs 0  fds 11  up 26s
+#   spoof IPs:
+#     ✔ 127.0.0.2      healthy  sent=39  last=2s ago
+#     ✔ 127.0.0.3      healthy  sent=33  last=2s ago
+
+# Force-clear a quarantined spoof IP's cooldown (client role only — see
+# Multi-Spoof-IP Management for what healthy/quarantined/untested mean)
+quiccochet admin srcpool resurrect 127.0.0.2 -c client-config.json -H
+# ▶ 127.0.0.2 is healthy again
+quiccochet admin srcpool resurrect -c client-config.json -H   # no ip = clear all
+# ▶ 3 entries resurrected
 
 # In-link latency bench (ping over a dedicated QUIC stream)
 quiccochet admin bench latency 2s -c client-config.json -H
@@ -694,13 +987,9 @@ quiccochet admin bench latency 2s -c client-config.json -H
 # Omit N and the daemon uses quic.pool_size (the sweet spot).
 quiccochet admin bench throughput 3s -c client-config.json -H
 # ▶ throughput  906.82 MiB in 3.00s  rate 302.26 MiB/s (2.54 Gbps)  × 4 streams
-
-# Override the fan-out explicitly (e.g. 8 parallel streams)
-quiccochet admin bench throughput 3s 8 -c client-config.json -H
-# ▶ throughput  899.84 MiB in 3.00s  rate 299.92 MiB/s (2.52 Gbps)  × 8 streams
 ```
 
-The bench runs on dedicated QUIC streams on the existing pool, so it measures the real tunnel (not the SOCKS5 proxy path) and doesn't require any extra config on the peer — bench is driven entirely from the client side. `bench` is rejected on a server-side socket (server is passive with respect to bench requests).
+The bench runs on dedicated QUIC streams on the existing pool, so it measures the real tunnel and doesn't require any extra config on the peer — bench is driven entirely from the client side. `bench` is rejected on a server-side socket (server is passive with respect to bench requests); so is `srcpool` (the server role doesn't run a spoof source pool).
 
 **On-demand pprof.** The admin socket can also toggle a `net/http/pprof` endpoint on the live daemon for leak / CPU investigations, without redeploying:
 
@@ -719,11 +1008,11 @@ quiccochet admin pprof stop -c client-config.json -H
 
 Go's built-in heap sampler runs regardless (`MemProfileRate` = 512 KiB), so a profile taken right after `start` covers the process' full lifetime. The HTTP listener only exists between `start` and `stop`; default binding is loopback-only because the admin socket already gates access to `0600` root.
 
-**Why parallel matters.** A single QUIC stream is capped by `max_stream_receive_window` (5 MB default); on a high-BDP link that saturates well below the physical bandwidth. Throughput bench therefore defaults to fanning out across `quic.pool_size` concurrent streams — each one round-robins onto a different QUIC connection in the pool, so the per-connection window is not the bottleneck either. Oversubscribing beyond `pool_size` is wasted work once the physical pipe is full. Latency bench stays single-stream by design, so its numbers reflect RTT and not cross-stream contention.
+**Why parallel matters.** A single QUIC stream is capped by `max_stream_receive_window` (32 MB default); on a high-BDP link that saturates well below the physical bandwidth. Throughput bench therefore defaults to fanning out across `quic.pool_size` concurrent streams — each one round-robins onto a different QUIC connection in the pool, so the per-connection window is not the bottleneck either. Oversubscribing beyond `pool_size` is wasted work once the physical pipe is full. Latency bench stays single-stream by design, so its numbers reflect RTT and not cross-stream contention.
 
 ### Prometheus Metrics
 
-An opt-in HTTP `/metrics` endpoint exposes the same `Snapshot` that powers the [Admin Socket](#admin-socket) in Prometheus text format, ready to be scraped by a Prometheus server and rendered in Grafana. The endpoint is dormant unless explicitly enabled and binds loopback by default; pick a distinct port per daemon when running multiple instances on one host.
+An opt-in HTTP `/metrics` endpoint exposes the same `Snapshot` that powers the [Admin Socket](#admin-socket) in Prometheus text format, ready to be scraped by a Prometheus server and rendered in Grafana. The endpoint is dormant unless explicitly enabled and binds loopback by default; pick a distinct port per daemon when running multiple instances on one host (the [tier templates](#performance-tiers) already do this — `9200` client, `9201` server).
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -743,7 +1032,7 @@ An opt-in HTTP `/metrics` endpoint exposes the same `Snapshot` that powers the [
 | `quiccochet_open_fds` | gauge | both | Open file descriptors |
 | `quiccochet_pool_alive` | gauge | client | Healthy QUIC connections |
 | `quiccochet_pool_total` | gauge | client | Configured `quic.pool_size` |
-| `quiccochet_udp_assocs` | gauge | client | Active SOCKS5 UDP ASSOCIATE sessions |
+| `quiccochet_udp_assocs` | gauge | client | Active SOCKS5 UDP ASSOCIATE sessions (legacy relay datapath) |
 | `quiccochet_active_sessions` | gauge | server | Inbound stream/datagram sessions |
 | `quiccochet_udp_routes_total` | counter | server | Cumulative UDP NAT routes installed |
 | `quiccochet_udp_evictions_total` | counter | server | UDP NAT routes evicted under pressure |
@@ -754,8 +1043,9 @@ An opt-in HTTP `/metrics` endpoint exposes the same `Snapshot` that powers the [
 | `quiccochet_quic_packets_sent_total` | counter | client | QUIC packets transmitted across the pool |
 | `quiccochet_quic_packets_lost` | gauge | client | QUIC packets currently considered lost |
 | `quiccochet_quic_bytes_lost` | gauge | client | QUIC bytes currently considered lost |
+| `quiccochet_spoof_ip_*` | gauge/counter | client | Per-spoof-IP health from the `SrcPool` (see [Multi-Spoof](#multi-spoof)) — `{ip="..."}` label |
 
-**Per-peer (server only).** From v2.0.2 the server also emits a parallel set of `quiccochet_peer_*` series, one per configured `peers[]` entry. Each carries a `peer="<name>"` label alongside `role="server"`. They coexist with the aggregated server metrics above — `sum by (role) (quiccochet_peer_bytes_sent_total)` equals `quiccochet_bytes_sent_total{role="server"}`, modulo a small residual attributed only globally (packets from unknown wire IPs that TLS pinning rejects). Existing dashboards on the role-only series keep working unchanged.
+**Per-peer (server only).** The server also emits a parallel set of `quiccochet_peer_*` series, one per configured `peers[]` entry. Each carries a `peer="<name>"` label alongside `role="server"`. They coexist with the aggregated server metrics above — `sum by (role) (quiccochet_peer_bytes_sent_total)` equals `quiccochet_bytes_sent_total{role="server"}`, modulo a small residual attributed only globally (packets from unknown wire IPs that TLS pinning rejects).
 
 | Metric | Type | Notes |
 |---|---|---|
@@ -791,136 +1081,7 @@ An opt-in HTTP `/metrics` endpoint exposes the same `Snapshot` that powers the [
 
 **Multiple daemons on one host.** Each instance needs its own port — pick `9200`, `9201`, `9202`, … in your configs. The endpoint binds loopback by default; expose externally only behind your own auth/TLS layer (a reverse proxy or a dedicated WireGuard mgmt iface).
 
-### Outbound Proxy (server mode only)
-
-The server can forward all tunneled traffic through an upstream SOCKS5 proxy (e.g. a local `sing-box`/`xray` instance). This is useful when the server's IP itself is blocked from reaching the final targets and needs a second hop, or when you want to layer a separate censorship-evasion stack.
-
-| Key | Description |
-|-----|-------------|
-| `outbound_proxy.enabled` | `true` to route TCP streams and UDP datagrams through the upstream proxy |
-| `outbound_proxy.type` | Currently only `"socks5"` |
-| `outbound_proxy.address` | `host:port` of the upstream proxy |
-| `outbound_proxy.username`, `outbound_proxy.password` | Optional RFC 1929 auth |
-
-When enabled, the server skips its own DNS resolution for the final TCP dial and lets the proxy do it (preventing DNS leaks of the final target from the server's network). UDP ASSOCIATE is used for datagrams — the relay keeps a per-flow TCP control channel to the upstream proxy with a 2-minute idle timeout to prevent fd accumulation.
-
-The private-target guard `security.block_private_targets` (default `true`) rejects RFC 1918 / ULA / link-local destinations supplied as IP literals on both direct and proxy paths. In proxy mode hostnames are forwarded verbatim to the upstream proxy — DNS resolution is delegated to the proxy so the server never queries its own resolver, which would leak every client lookup to the host's local DNS.
-
-Cloud metadata endpoints (`169.254.169.254`, `metadata.google.internal`, `100.100.100.200`, `fd00:ec2::254`, …) are **always** blocked regardless of `block_private_targets`, because they only ever serve secrets and have no legitimate proxy use case.
-
-<a id="reverse-port-forwarding"></a>
-### Reverse Port Forwarding (ssh -R)
-
-Expose a port on the **server** that tunnels back to a service reachable by the **client** — the mirror image of a `forward` inbound (which listens on the client and dials on the server). Equivalent to `ssh -R`: a connection to `server:PORT` is spliced over the existing QUIC link to the named peer, which dials the configured target on its own host.
-
-**Server** declares one or more `reverse_forwards` rules:
-
-```json
-"reverse_forwards": [
-  { "listen": "0.0.0.0:8443", "peer": "laptop", "target": "127.0.0.1:8443" }
-]
-```
-
-| Key | Description |
-|-----|-------------|
-| `listen` | Server bind address. `host:port`, `:port`, or a bare `port`. Must be unique across rules. |
-| `peer` | Which `peers[].name` receives these connections. Connections are dropped while that peer is offline. |
-| `target` | Client-local address the peer dials. Optional — defaults to `127.0.0.1:<listen-port>`. |
-
-A `listen` without an explicit host (`:8443` or `8443`) binds to **loopback** `127.0.0.1` and logs a notice at startup — set an explicit host such as `0.0.0.0:8443` to expose it publicly (ssh `GatewayPorts=no` parity).
-
-**Client** gates which targets the server may ask it to dial with a default-deny allow list:
-
-```json
-"reverse_accept": {
-  "enabled": true,
-  "allow": ["127.0.0.1:8443"]
-}
-```
-
-| Key | Description |
-|-----|-------------|
-| `enabled` | Master switch. When `false` (default) every reverse connection is refused. |
-| `allow` | Authorised targets. `host:port` matches that exact address; a bare `host` matches any port on that host. |
-
-The client refuses any target not on the list, so the server can never coerce it into dialing an arbitrary address.
-
-The admin TUI can configure both sides: the config wizard (`quiccochet ui` -> New) adds a server-mode step for `reverse_forwards` rules (with a peer picker) and a client-mode step for the `reverse_accept` policy, and the config editor (Open existing) exposes matching sections for editing them in place.
-
-<a id="sendmsg-ip-transparent"></a>
-### sendmsg + IP_TRANSPARENT (UDP transport)
-
-When using the `udp` transport, QUICochet automatically probes for `IP_TRANSPARENT` (or `IPV6_TRANSPARENT` on v6 / dual-stack) support on the receive socket. If available (Linux kernel ≥ 2.6.28, CAP_NET_RAW + CAP_NET_ADMIN — both already required), the send path switches from raw sockets with manual IP/UDP header construction to `sendmsg(2)` with `IP_PKTINFO` / `IPV6_PKTINFO` cmsg for per-packet source IP selection. This gives:
-
-- **No manual headers**: the kernel builds IP + UDP headers, freeing ~300 ns/pkt of CPU
-- **TX checksum offload**: the kernel delegates IP/UDP checksum to the NIC if supported, further reducing CPU in the hot path
-- **Multi-spoof integration**: the randomly selected source IP is set via `ipi_spec_dst` (v4) or `ipi6_addr` (v6) in the cmsg — no per-IP checksum recomputation
-- **Cleaner socket model**: a single `SOCK_DGRAM` fd handles both send and receive (the separate `SOCK_RAW` + `IP_HDRINCL` fd is closed)
-
-If the probe fails (e.g. missing capability or very old kernel), the transport silently falls back to the raw socket path with full backward compatibility. The mode is logged at startup:
-
-```
-INFO  udp transport: sendmsg mode enabled  component=transport  v6_socket=false  dual_stack=false
-```
-
-The `raw`, `icmp`, and `syn_udp` transports are unaffected — they need `IP_HDRINCL` for protocol-level tricks that `SOCK_DGRAM` cannot express.
-
-<a id="ipv6-deployment"></a>
-### IPv6 Deployment
-
-QUICochet supports IPv6 end-to-end across the `udp`, `icmp`, `raw`, and `syn_udp` transports. The same mutual-spoof model applies: `source_ipv6s` is the list of v6 addresses inserted into the IP header on send, and `peer_spoof_ipv6s` is the receive-side filter that drops packets from any other v6 source. Inner-v6 (tunnelling traffic to a v6 destination) works on top of any outer transport — SOCKS5 ATYP=v6 is wired both for TCP CONNECT and UDP ASSOCIATE.
-
-Single-stack v6 (client side):
-
-```jsonc
-{
-  "spoof": {
-    "source_ipv6s":     ["2a01:4f9:c012:abc::10"],
-    "peer_spoof_ipv6s": ["2a01:4f9:c012:abc::20"]
-  }
-  // ...
-}
-```
-
-Server side, the same v6 fields move into the per-peer entry:
-
-```jsonc
-"peers": [
-  {
-    "name": "vpn1",
-    "peer_public_key": "...",
-    "client_real_ipv6": "2a01:4f9:c012:abc::30",
-    "peer_spoof_ipv6s": ["2a01:4f9:c012:abc::10"]
-  }
-]
-```
-
-Dual-stack `udp` transport (the only transport with single-socket dual-stack today; others need separate v4/v6 deployments). Client side:
-
-```jsonc
-{
-  "spoof": {
-    "source_ips":       ["10.0.0.10"],
-    "peer_spoof_ips":   ["10.0.0.20"],
-    "source_ipv6s":     ["2a01:4f9:c012:abc::10"],
-    "peer_spoof_ipv6s": ["2a01:4f9:c012:abc::20"]
-  }
-  // ...
-}
-```
-
-Server-side dual-stack: each peer carries both `client_real_ip` and `client_real_ipv6`, plus the v4 and v6 spoof lists.
-
-When both families are configured the `udp` transport binds a single socket on `[::]:port` with `IPV6_V6ONLY=0` so v4 (via the `::ffff:` mapped form) and native v6 land on the same recv loop. Outbound packets are routed to the matching `realPeer` slot per family — a v4 client and a v6 client connecting to the same dual-stack server each maintain their own learned ephemeral port without crossing.
-
-**Caveats:**
-
-- **Symmetric peer-spoof in dual-stack**: if you set `peer_spoof_ips` you MUST also set `peer_spoof_ipv6s`, and vice versa. An asymmetric filter would silently leave the unfiltered family open to off-path UDP injection. The transport refuses to start when this is misconfigured.
-- **`syn_udp` is single-stack**: configure `source_ips` OR `source_ipv6s`, not both. Dual-stack `syn_udp` would need parallel raw-socket recv loops on disjoint v4/v6 sockets — tracked but not yet implemented.
-- **`syn_udp` v6 needs `IPV6_TRANSPARENT`** (CAP_NET_ADMIN). The kernel builds the v6 IP header itself; we override the source via `IPV6_PKTINFO` cmsg per packet, which only works when the socket has `IPV6_TRANSPARENT` set.
-- **uRPF on v6 transit**: some hosting providers and middle-boxes enforce strict source-address validation on IPv6 (more common than on v4). Spoofed v6 source IPs may be silently dropped on some uplinks. Verify with `tcpdump` on the egress interface before assuming a quiet failure is a code bug.
-- **Hardened blocklist**: cloud-metadata endpoints (`fd00:ec2::254` for AWS, `fd00:c1:c0:1::1` for Oracle, …) and exotic v6 prefixes that wrap or tunnel a v4 destination (Teredo `2001::/32`, 6to4 `2002::/16`, deprecated v4-compatible `::/96`, RFC 3879 site-local `fec0::/10`, RFC 6666 discard `100::/64`) are unconditionally rejected when `block_private_targets=true` — this defangs DNS-rebinding attacks that try to reach the server's internal network through a v6 wrapper.
-- **Hetzner / DO / GCP** allocate a `/64` per instance by default; pick a few addresses inside that block for `source_ipv6s` multi-spoof. The allocation is verified by `ip -6 addr show`.
+---
 
 <a id="performance-tuning-os"></a>
 ## 🛠️ OS-Level Tuning
@@ -954,9 +1115,9 @@ sudo sysctl -p /etc/sysctl.d/99-quiccochet.conf
 
 ### File Descriptor Limit
 
-The SOCKS5 outbound proxy path opens one TCP control connection to the upstream proxy for every unique UDP flow (one per SOCKS5 UDP ASSOCIATE route). Under a DNS/UDP-heavy burst from a busy client, the server can hold thousands of such fds at once before the 2-minute idle timeout drains them. In a production run we measured a peak of **~21 000 open fds** during a few-second burst — well above the typical systemd default of `65535` on some distros, and uncomfortably close to ephemeral-port exhaustion.
+The legacy SOCKS5 outbound proxy path opens one TCP control connection to the upstream proxy for every unique UDP flow (one per SOCKS5 UDP ASSOCIATE route). Under a DNS/UDP-heavy burst from a busy client, the server can hold thousands of such fds at once before the idle timeout drains them. In a production run we measured a peak of **~21 000 open fds** during a few-second burst on this datapath — well above the typical systemd default of `65535` on some distros. (TUN mode has no per-flow fd at all — see [TUN / Layer-3 Mode](#tun-mode) — but the same headroom is worth keeping regardless.)
 
-Set `LimitNOFILE=1048576` on both systemd units (`quiccochet-server.service` and `quiccochet-client.service`):
+`spoof-tunnel.sh` already sets `LimitNOFILE=1048576` on every systemd unit it installs. If you're writing your own unit by hand:
 
 ```ini
 [Service]
@@ -964,7 +1125,7 @@ Set `LimitNOFILE=1048576` on both systemd units (`quiccochet-server.service` and
 LimitNOFILE=1048576
 ```
 
-The e2e provisioning scripts (`test/e2e/provision-{server,client}.sh`) and `deploy.sh` already apply this. Verify on a running instance with:
+Verify on a running instance with:
 
 ```bash
 cat /proc/$(pgrep -f quiccochet)/limits | grep 'Max open files'
@@ -988,12 +1149,10 @@ sudo sysctl -p /etc/sysctl.d/99-quiccochet.conf
 
 > **Note:** This disables `ping` on the machine. If you switch back to a non-ICMP transport, re-enable it with `sysctl -w net.ipv4.icmp_echo_ignore_all=0`.
 
-The e2e provisioning scripts (`test/e2e/provision-common.sh`) set this automatically.
-
 <a id="benchmark-results"></a>
 ## 📊 Benchmarks
 
-> These are **LAN-local** numbers from a controlled environment with ~0.2 ms RTT and no packet loss. They show the implementation has near-line-rate headroom on a clean path. **Real-world throughput over a high-RTT censored WAN with `standard` obfuscation and an upstream SOCKS5 hop will be significantly lower** — typically in the single-digit Mbps range sustained, because of fixed-size padding, RTT-bound QUIC windows, and the upstream proxy latency. Use these figures to reason about upper bounds, not end-user experience.
+> These are **LAN-local** numbers from a controlled environment with ~0.2 ms RTT and no packet loss. They show the implementation has near-line-rate headroom on a clean path. **Real-world throughput over a high-RTT censored WAN with `standard` obfuscation will be significantly lower** — typically in the single-digit-to-low-hundreds Mbps range sustained, because of fixed-size padding, RTT-bound QUIC windows, and path conditions. Use these figures to reason about upper bounds, not end-user experience.
 
 **Test Environment:**
 - 2x KVM VMs (4 vCPU AMD EPYC-Genoa, 4 GB RAM, libvirt private network, ~0.2 ms RTT)
@@ -1001,7 +1160,7 @@ The e2e provisioning scripts (`test/e2e/provision-common.sh`) set this automatic
 - Obfuscation: `standard` (padding to MTU, ChaCha20-Poly1305 AEAD)
 - `sendmsg` + `IP_TRANSPARENT` active on UDP, ICMP, RAW (auto-probed at startup)
 
-**Results (all transports, 15s iperf3):**
+**Results (all transports, legacy SOCKS5-relay datapath, 15s iperf3):**
 
 Single stream (1 connection):
 ```
@@ -1023,44 +1182,48 @@ RAW          1151 Mbps      1207 Mbps
 ICMP         1012 Mbps      1031 Mbps
 ```
 
-> **Where is the ceiling?** Single-stream throughput plateaus at ~1.1 Gbps — this is the ChaCha20-Poly1305 AEAD cost in the obfuscation layer. Multi-stream scales past 2 Gbps because QUIC parallelizes encryption across goroutines. ICMP is ~20% slower due to kernel ICMP path overhead. SYN+UDP upload is asymmetric by design (client sends TCP SYN, see [Transport Details](#transport-details)).
+> **Where is the ceiling?** Single-stream throughput plateaus at ~1.1 Gbps — this is the ChaCha20-Poly1305 AEAD cost in the obfuscation layer (AES-256-GCM is picked automatically instead on AES-NI/ARMv8 hardware — see [Architecture](#why-quic)). Multi-stream scales past 2 Gbps because QUIC parallelizes encryption across goroutines. ICMP is ~20% slower due to kernel ICMP path overhead. SYN+UDP upload is asymmetric by design (client sends TCP SYN, see [Transport Details](#transport-details)).
+
+**TUN/L3 vs. the legacy relay under realistic multi-user load (many small concurrent flows, not raw throughput):** see [`docs/PROFILING-BASELINE.md`](docs/PROFILING-BASELINE.md) for the profile that identified per-flow relay state as the dominant CPU cost, and [`docs/LOADTEST-BEFORE-AFTER.md`](docs/LOADTEST-BEFORE-AFTER.md) for the numeric before/after: CPU roughly halved and fd usage went from a load-proportional burst to a small fixed footprint at equal flow-churn load. [`docs/TUN-STABILITY.md`](docs/TUN-STABILITY.md) covers spoof-IP health-check and TUN-interface persistence verification under that same setup.
 
 <a id="roadmap"></a>
 ## 🗺️ Roadmap
 
-<a id="complete"></a>
 ### ✅ Complete
 
 - ✅ QUIC integration with stream multiplexing
-- ✅ ChaCha20-Poly1305 encryption
+- ✅ ChaCha20-Poly1305 / AES-256-GCM encryption, auto-selected by CPU capability
 - ✅ Obfuscation layer (padding + size binning + idle-gap chaffing)
 - ✅ Connection pooling with exponential backoff and parallel reconnect
 - ✅ 4 transport modes: UDP, ICMP, RAW, SYN+UDP (all verified with IP spoofing)
-- ✅ UDP relay via QUIC datagrams with SOCKS5 UDP ASSOCIATE
+- ✅ **TUN/L3 datapath**: whole-IP routing over a persistent interface, replacing per-flow relay state as the primary high-throughput path
+- ✅ **Batched TUN I/O**: `IFF_MULTI_QUEUE` parallel queues with optional core pinning
+- ✅ **Four performance tiers** with hardware-aware auto-suggestion in the wizard
+- ✅ **Multi-tunnel orchestration**: `spoof-tunnel.sh` manages any number of independent, systemd-backed tunnels on one box
+- ✅ **Multi-spoof-IP management from the running config**, with live health surfaced in the admin CLI and the manager's menu
+- ✅ UDP relay via QUIC datagrams with SOCKS5 UDP ASSOCIATE (legacy datapath, still available alongside TUN)
 - ✅ Outbound proxy support (SOCKS5 TCP + UDP, zero IP leak)
-- ✅ E2E test environment with Vagrant
 - ✅ HKDF key derivation (RFC 5869) replacing XOR-based KDF
-- ✅ ICMP transport kernel configuration documentation
 - ✅ Anti-SSRF: private target blocking with DNS rebinding prevention
 - ✅ Replay protection: sliding-window bitmap with session-unique nonce prefix
 - ✅ Structured logging (`log/slog`)
 - ✅ Optional BBR v1 congestion control (experimental, via community fork)
 - ✅ Idle-timeout cleanup for SOCKS5 UDP ASSOCIATE proxy routes (no fd leak)
 - ✅ MTU floor validation (`1231`) to preserve QUIC + obfuscator invariants
-- ✅ Multi-spoof: random source IP selection from a configurable list
+- ✅ Multi-spoof: source IP selection from a configurable list, with runtime health-check/quarantine
 - ✅ `sendmsg` + `IP_TRANSPARENT` / `IPV6_TRANSPARENT` for UDP, ICMP, RAW (auto-probed, kernel builds IP headers, v4 and v6)
 - ✅ Fan-in scale: `MaxIncomingStreams` default 100k, bidirectional UDP route idle tracking, LRU eviction
-- ✅ Admin Unix socket: on-demand stats and in-link latency/throughput bench over a dedicated QUIC stream (`quiccochet admin stats | bench …`)
+- ✅ Admin Unix socket: on-demand stats, spoof-IP pool control, in-link latency/throughput bench over a dedicated QUIC stream
 - ✅ Multi-stream throughput bench: parallel QUIC streams spread across the pool, defaulting to `quic.pool_size` to saturate high-BDP links
-- ✅ Full IPv6 across all transports (v1.17.0): UDP single-socket dual-stack, ICMP/RAW dual-stack via parallel recv loops, syn_udp v6 single-stack via `IPV6_HDRINCL`, hardened SSRF blocklist (6to4/Teredo/v4-compatible/site-local), per-family realPeer routing, symmetric peer-spoof guard
+- ✅ Full IPv6 across all transports: UDP single-socket dual-stack, ICMP/RAW dual-stack via parallel recv loops, syn_udp v6 single-stack via `IPV6_HDRINCL`, hardened SSRF blocklist (6to4/Teredo/v4-compatible/site-local), per-family realPeer routing, symmetric peer-spoof guard
 
-<a id="future"></a>
 ### ⏳ Future
 
 - [ ] **Forward Secrecy**: Noise-IK ephemeral handshake for PFS
 - [ ] **Adaptive Padding**: Machine-learning-resistant traffic patterns
 - [ ] **Dual-stack `syn_udp`**: parallel raw-socket recv loops on disjoint v4/v6 sockets (today single-stack only)
-- [ ] **Automated E2E test runner**: `run-tests.sh` with assertions
+- [ ] **IPv6 in the wizard**: `spoof-tunnel.sh` currently only prompts for IPv4 spoof/tunnel addresses; the v6 fields are hand-edit-only
+- [ ] **Soak testing**: current load tests run tens of seconds to minutes; a multi-hour continuous-load run would catch slow memory/resource drift that a short burst can't
 - [ ] **BBR upstreaming**: track [`quic-go#4565`](https://github.com/quic-go/quic-go/issues/4565) and drop the fork once merged
 
 <a id="contributing"></a>
@@ -1078,7 +1241,7 @@ Contributions are welcome! Please read our contributing guidelines:
 
 ```bash
 go mod download
-go test ./internal/...
+go test ./internal/... ./cmd/...
 go build ./cmd/quiccochet/
 ```
 
@@ -1086,10 +1249,9 @@ go build ./cmd/quiccochet/
 ## 🙏 Acknowledgments
 
 - [quic-go](https://github.com/quic-go/quic-go) - QUIC implementation in Go
+- [PechenyeRU/quiccochet](https://github.com/PechenyeRU/quiccochet) - the original engine this fork builds on
 - Inspired by the need for resilient communication in restrictive network environments
 
 ---
 
-**Maintained by [@PechenyeRU](https://github.com/PechenyeRU)**
-
-This project is HEAVILY inspired by [**Spoof Tunnel**](https://github.com/ParsaKSH/spoof-tunnel) which was the original project. QUICochet represents a different approach with QUIC transport.
+**This fork maintained at [originnova555-hue/esp-tun](https://github.com/originnova555-hue/esp-tun)** · original engine by [@PechenyeRU](https://github.com/PechenyeRU)
