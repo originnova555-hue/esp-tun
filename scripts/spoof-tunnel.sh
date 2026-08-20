@@ -28,7 +28,7 @@ W=$'\e[1;37m' DIM=$'\e[2m' BOLD=$'\e[1m' RST=$'\e[0m'
 p()   { printf '%s\n' "$*"; }
 pi()  { printf "${C}  ▶ %s${RST}\n" "$*"; }
 pok() { printf "${G}  ✔ %s${RST}\n" "$*"; }
-pw()  { printf "${Y}  ⚠ %s${RST}\n" "$*"; }
+pw()  { printf "${Y}  ⚠ %s${RST}\n" "$*" >&2; }
 pe()  { printf "${R}  ✘ %s${RST}\n" "$*" >&2; }
 die() { pe "$*"; exit 1; }
 br()  { p ""; }
@@ -231,6 +231,138 @@ except Exception:
 PYEOF
 }
 
+# json_get_list <file> <dotted.path> — prints each element of the array
+# at path, one per line. Empty output (not an error) when the path is
+# missing or isn't a list.
+json_get_list() {
+    python3 - "$1" "$2" <<'PYEOF'
+import json, sys
+path, key = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        d = json.load(f)
+    for seg in key.split("."):
+        d = d[int(seg)] if isinstance(d, list) else d[seg]
+    if isinstance(d, list):
+        for item in d:
+            print(item)
+except Exception:
+    pass
+PYEOF
+}
+
+# json_list_add / json_list_remove <file> <dotted.path> <value> — add
+# (deduped) or remove a string value from the array at path, rewriting
+# the file in place with the same 2-space indent as the rest of the
+# config writer. Fails loudly (nonzero exit, message on stderr) if the
+# path doesn't resolve to a list, so a caller under `set -e` aborts
+# rather than silently no-op-ing on a malformed config.
+json_list_add()    { _json_list_op "$1" "$2" add    "$3"; }
+json_list_remove() { _json_list_op "$1" "$2" remove "$3"; }
+_json_list_op() {
+    python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
+import json, sys
+path, key, op, value = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+with open(path) as f:
+    d = json.load(f)
+node = d
+segs = key.split(".")
+for seg in segs[:-1]:
+    node = node[int(seg)] if isinstance(node, list) else node[seg]
+last = segs[-1]
+last = int(last) if isinstance(node, list) else last
+lst = node[last]
+if not isinstance(lst, list):
+    print(f"json_list_op: {key} is not a list", file=sys.stderr)
+    sys.exit(1)
+if op == "add":
+    if value not in lst:
+        lst.append(value)
+elif op == "remove":
+    if value in lst:
+        lst.remove(value)
+with open(path, "w") as f:
+    json.dump(d, f, indent=2)
+PYEOF
+}
+
+# valid_ipv4 <str> — true if str is a syntactically valid dotted-quad
+# IPv4 address (each octet 0-255, no leading garbage).
+valid_ipv4() {
+    local ip="$1" o
+    [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+    # IFS is set locally (not exported to the caller) so this function
+    # splits on '.' correctly regardless of what IFS the caller has set
+    # — e.g. read_ip_list below sets IFS=',' around its own loop, and
+    # without this, `for o in ${ip//./ }` would silently stop
+    # splitting on whitespace and hand the *whole* dotted string to the
+    # arithmetic test as one token.
+    local IFS='.'
+    local -a octets
+    read -ra octets <<< "$ip"
+    for o in "${octets[@]}"; do
+        # Reject leading-zero octets ("008") before the arithmetic test
+        # below: bash's `((...))` parses a leading-zero literal as
+        # octal, so "008"/"009" would throw "value too great for base"
+        # (base-8 has no digit 8/9) instead of failing cleanly, and a
+        # value like "010" would silently mean decimal 8, not ten.
+        [[ "$o" =~ ^0[0-9] ]] && return 1
+        (( o <= 255 )) || return 1
+    done
+    return 0
+}
+
+# build_json_str_array <str...> — prints a JSON array literal of the
+# given strings. Only used with values already validated by
+# valid_ipv4 (digits and dots only), so no escaping is needed.
+build_json_str_array() {
+    local out="[" first=1 x
+    for x in "$@"; do
+        [[ $first -eq 0 ]] && out+=","
+        out+="\"${x}\""
+        first=0
+    done
+    out+="]"
+    printf '%s' "$out"
+}
+
+# read_ip_list <default-csv> — prompts (caller must print the prompt
+# text first) for a comma-separated IPv4 list, re-prompting until every
+# entry validates and at least one address is given. Prints the
+# validated addresses one per line on success.
+read_ip_list() {
+    local default_csv="$1" raw entry ips
+    while true; do
+        read -r raw || die "Unexpected end of input while reading an IP list"
+        raw="${raw:-$default_csv}"
+        ips=()
+        local bad=""
+        local IFS=','
+        for entry in $raw; do
+            entry="${entry// /}"
+            [[ -z "$entry" ]] && continue
+            if ! valid_ipv4 "$entry"; then
+                bad="$entry"
+                break
+            fi
+            ips+=("$entry")
+        done
+        unset IFS
+        if [[ -n "$bad" ]]; then
+            pw "Invalid IPv4 address: $bad"
+            printf "  Try again: " >&2
+            continue
+        fi
+        if [[ ${#ips[@]} -eq 0 ]]; then
+            pw "At least one IP is required"
+            printf "  Try again: " >&2
+            continue
+        fi
+        printf '%s\n' "${ips[@]}"
+        return 0
+    done
+}
+
 # ── Header ────────────────────────────────────────────────────────────────────
 header() {
     clr
@@ -318,8 +450,9 @@ tunnel_manage_menu() {
         printf "  ${BOLD}%s${RST}  %s\n" "8)" "Auto restart timer ${DIM}(edit minutes)${RST}"
         printf "  ${BOLD}%s${RST}  %s\n" "9)" "Live stats ${DIM}(admin socket)${RST}"
         printf "  ${BOLD}%s${RST}  %s\n" "10)" "Benchmark ${DIM}(throughput/latency over live tunnel)${RST}"
-        printf "  ${BOLD}%s${RST}  %s\n" "11)" "Remove tunnel"
-        printf "  ${BOLD}%s${RST}  %s\n" "12)" "Back"
+        printf "  ${BOLD}%s${RST}  %s\n" "11)" "Manage spoof IPs ${DIM}(add/remove, health)${RST}"
+        printf "  ${BOLD}%s${RST}  %s\n" "12)" "Remove tunnel"
+        printf "  ${BOLD}%s${RST}  %s\n" "13)" "Back"
         sep
         br
         printf "  Select: "
@@ -339,13 +472,14 @@ tunnel_manage_menu() {
             8) manage_restart_timer_menu "$name" ;;
             9) _admin_stats "$name"; pause ;;
             10) _admin_bench_menu "$name" ;;
-            11) require_root
+            11) require_root; _spoof_ip_menu "$name" ;;
+            12) require_root
                br; printf "  ${Y}Remove tunnel '${name}'? [y/N]:${RST} "; read -r ans
                if [[ "${ans,,}" == "y" ]]; then
                    _remove_tunnel "$name"
                    pok "Removed: $name"; pause; return
                fi ;;
-            12|b|B|q|Q) return ;;
+            13|b|B|q|Q) return ;;
             *) pw "Invalid"; pause ;;
         esac
     done
@@ -382,6 +516,187 @@ _admin_bench_menu() {
     br
     pi "Throughput..."
     "$BINARY" admin --socket "$sock" -H bench throughput "${dur}s" "$par" 2>&1 || pe "bench throughput failed"
+    pause
+}
+
+# ── Spoof IP management ───────────────────────────────────────────────────────
+# _spoof_health_snapshot <name> — prints "ip\tstate" lines (state one of
+# healthy/quarantined/untested) from a *running* tunnel's admin socket,
+# reflecting real send/quarantine history from the live SrcPool — not a
+# synthetic one-off probe. Empty output (not an error) when the tunnel
+# isn't running or exposes no spoof pool (e.g. server role).
+_spoof_health_snapshot() {
+    local name="$1"
+    local sock; sock="$(_admin_socket_for "$name")"
+    [[ -n "$sock" && -S "$sock" ]] || return 0
+    "$BINARY" admin --socket "$sock" stats 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for s in d.get("spoof_ips", []):
+    if s.get("sent_count", 0) == 0:
+        state = "untested"
+    elif s.get("healthy"):
+        state = "healthy"
+    else:
+        state = "quarantined"
+    ip = s.get("ip", "")
+    print(f"{ip}\t{state}")
+' 2>/dev/null
+}
+
+# _spoof_peer_path <cfg> — dotted json_get path to the "expected
+# incoming spoof IP" list for this config's mode: client keeps it at
+# the top-level spoof.peer_spoof_ips; server keeps it per-peer, and
+# the wizard here only ever creates a single peers[0].
+_spoof_peer_path() {
+    local cfg="$1" mode
+    mode="$(json_get "$cfg" "mode" "server")"
+    if [[ "$mode" == "server" ]]; then
+        printf 'peers.0.peer_spoof_ips'
+    else
+        printf 'spoof.peer_spoof_ips'
+    fi
+}
+
+_spoof_ip_menu() {
+    local name="$1"
+    local cfg; cfg="$(cfg_path "$name")"
+    [[ -f "$cfg" ]] || { pw "Config not found: $cfg"; pause; return; }
+    local peer_path; peer_path="$(_spoof_peer_path "$cfg")"
+
+    while true; do
+        header
+        p "  ${BOLD}Spoof IPs — ${name}${RST}"
+        br
+
+        declare -A _spoof_health=()
+        local ip st
+        while IFS=$'\t' read -r ip st; do
+            [[ -n "$ip" ]] && _spoof_health["$ip"]="$st"
+        done < <(_spoof_health_snapshot "$name")
+
+        p "  ${BOLD}Outgoing${RST}  ${DIM}(spoof.source_ips — this side's UDP src)${RST}"
+        mapfile -t src_ips < <(json_get_list "$cfg" "spoof.source_ips")
+        if [[ ${#src_ips[@]} -eq 0 ]]; then
+            p "    ${DIM}(none configured)${RST}"
+        else
+            local mark label
+            for ip in "${src_ips[@]}"; do
+                st="${_spoof_health[$ip]:-}"
+                case "$st" in
+                    healthy)     mark="${G}✔${RST}"; label="${G}healthy${RST}" ;;
+                    quarantined) mark="${R}✘${RST}"; label="${R}quarantined${RST}" ;;
+                    untested)    mark="${DIM}·${RST}"; label="${DIM}untested (no traffic sent yet)${RST}" ;;
+                    *)           mark="${DIM}?${RST}"; label="${DIM}unknown (tunnel not running)${RST}" ;;
+                esac
+                printf "    %b %-16s %b\n" "$mark" "$ip" "$label"
+            done
+        fi
+        br
+        p "  ${BOLD}Expected incoming${RST}  ${DIM}(${peer_path} — peer's spoof source)${RST}"
+        mapfile -t peer_ips < <(json_get_list "$cfg" "$peer_path")
+        if [[ ${#peer_ips[@]} -eq 0 ]]; then
+            p "    ${DIM}(none configured)${RST}"
+        else
+            for ip in "${peer_ips[@]}"; do
+                printf "    %s\n" "$ip"
+            done
+        fi
+        br
+        sep
+        p "  ${DIM}Health above reflects real traffic on the running tunnel, not a${RST}"
+        p "  ${DIM}synthetic probe — 'untested' means never yet used, not verified bad.${RST}"
+        p "  ${DIM}Add/remove changes need a tunnel restart to take effect.${RST}"
+        printf "  ${BOLD}%s${RST}  %s\n" "1)" "Add outgoing spoof IP"
+        printf "  ${BOLD}%s${RST}  %s\n" "2)" "Remove outgoing spoof IP"
+        printf "  ${BOLD}%s${RST}  %s\n" "3)" "Add expected-incoming IP"
+        printf "  ${BOLD}%s${RST}  %s\n" "4)" "Remove expected-incoming IP"
+        printf "  ${BOLD}%s${RST}  %s\n" "5)" "Force-resurrect a quarantined IP now"
+        printf "  ${BOLD}%s${RST}  %s\n" "6)" "Back"
+        sep
+        br
+        printf "  Select: "
+        local ch; read -r ch
+
+        case "$ch" in
+            1) _spoof_list_add "$cfg" "spoof.source_ips" "outgoing spoof IP" ;;
+            2) _spoof_list_remove "$cfg" "spoof.source_ips" "outgoing spoof IP" ;;
+            3) _spoof_list_add "$cfg" "$peer_path" "expected-incoming IP" ;;
+            4) _spoof_list_remove "$cfg" "$peer_path" "expected-incoming IP" ;;
+            5) _spoof_ip_resurrect "$name" ;;
+            6|b|B|q|Q) return ;;
+            *) pw "Invalid"; pause ;;
+        esac
+    done
+}
+
+_spoof_list_add() {
+    local cfg="$1" path="$2" label="$3"
+    br
+    printf "  New %s: " "$label"
+    local ip; read -r ip
+    if [[ -z "$ip" ]]; then
+        return
+    fi
+    if ! valid_ipv4 "$ip"; then
+        pw "Invalid IPv4 address: $ip"; pause; return
+    fi
+    json_list_add "$cfg" "$path" "$ip"
+    chmod 600 "$cfg"
+    pok "Added $ip to $label."
+    pw "Restart the tunnel for this to take effect (menu option 3, or CLI: restart $(basename "$cfg" .json))."
+    pause
+}
+
+_spoof_list_remove() {
+    local cfg="$1" path="$2" label="$3"
+    mapfile -t current < <(json_get_list "$cfg" "$path")
+    if [[ ${#current[@]} -eq 0 ]]; then
+        pw "No $label configured."; pause; return
+    fi
+    br
+    p "  Current $label:"
+    local i=1 ip
+    for ip in "${current[@]}"; do
+        printf "    %d) %s\n" "$i" "$ip"
+        ((i++))
+    done
+    printf "  Remove which number (Enter to cancel): "
+    local sel; read -r sel
+    [[ -z "$sel" ]] && return
+    if [[ ! "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > ${#current[@]} )); then
+        pw "Invalid selection"; pause; return
+    fi
+    if [[ ${#current[@]} -eq 1 ]]; then
+        pw "Refusing to remove the last $label — the tunnel needs at least one."
+        pause; return
+    fi
+    local target="${current[$((sel-1))]}"
+    json_list_remove "$cfg" "$path" "$target"
+    chmod 600 "$cfg"
+    pok "Removed $target from $label."
+    pw "Restart the tunnel for this to take effect (menu option 3, or CLI: restart $(basename "$cfg" .json))."
+    pause
+}
+
+_spoof_ip_resurrect() {
+    local name="$1"
+    local sock; sock="$(_admin_socket_for "$name")"
+    if [[ -z "$sock" || ! -S "$sock" ]]; then
+        pw "Admin socket not available (is the tunnel running?)"; pause; return
+    fi
+    br
+    printf "  IP to resurrect (Enter = all quarantined): "
+    local ip; read -r ip
+    br
+    if [[ -z "$ip" ]]; then
+        "$BINARY" admin --socket "$sock" -H srcpool resurrect 2>&1 || pe "resurrect failed"
+    else
+        "$BINARY" admin --socket "$sock" -H srcpool resurrect "$ip" 2>&1 || pe "resurrect failed"
+    fi
     pause
 }
 
@@ -488,10 +803,26 @@ tunnel_new_wizard() {
     # ── Spoof ────────────────────────────────────────────────────────────────
     br; sep
     p  "  ${BOLD}Spoof IPs${RST}"
-    printf "  Spoof source IP — sent as UDP src   [${default_spoof_src}]: "; read -r spoof_src
-    spoof_src="${spoof_src:-$default_spoof_src}"
-    printf "  Spoof dest IP   — expected incoming [${default_spoof_dst}]: "; read -r spoof_dst
-    spoof_dst="${spoof_dst:-$default_spoof_dst}"
+    p  "  ${DIM}One or more, comma-separated (e.g. 1.2.3.4,5.6.7.8). More than${RST}"
+    p  "  ${DIM}one gives automatic failover if the carrier later blocks one.${RST}"
+    p  "  ${DIM}You can add/remove these later from the tunnel's menu.${RST}"
+    br
+    p  "  Spoof source IP(s) — sent as UDP src"
+    printf "  [${default_spoof_src}]: "
+    local spoof_src_list=()
+    mapfile -t spoof_src_list < <(read_ip_list "$default_spoof_src")
+    # read_ip_list runs inside a process-substitution subshell, so its
+    # own `die` on EOF can't terminate this script — it only ends the
+    # subshell, leaving mapfile with an empty array. Catch that here
+    # instead of silently writing a config with an empty source_ips.
+    [[ ${#spoof_src_list[@]} -gt 0 ]] || die "No spoof source IP(s) provided"
+    p  "  Spoof dest IP(s)   — expected incoming"
+    printf "  [${default_spoof_dst}]: "
+    local spoof_dst_list=()
+    mapfile -t spoof_dst_list < <(read_ip_list "$default_spoof_dst")
+    [[ ${#spoof_dst_list[@]} -gt 0 ]] || die "No spoof dest IP(s) provided"
+    local spoof_src_json; spoof_src_json="$(build_json_str_array "${spoof_src_list[@]}")"
+    local spoof_dst_json; spoof_dst_json="$(build_json_str_array "${spoof_dst_list[@]}")"
 
     # ── Tunnel settings ───────────────────────────────────────────────────────
     br; sep
@@ -609,7 +940,7 @@ cfg["_tier_name"] = "${tier}"
 
 cfg["mode"] = "${mode}"
 cfg["listen_port"] = ${port}
-cfg["spoof"]["source_ips"] = ["${spoof_src}"]
+cfg["spoof"]["source_ips"] = json.loads('${spoof_src_json}')
 cfg["crypto"]["private_key"] = "${own_priv}"
 cfg["tun"]["name"] = "${tname}"
 cfg["tun"]["local"] = "${tlocal}/24"
@@ -620,7 +951,7 @@ if "${mode}" == "server":
         "name": "${peer_name}",
         "peer_public_key": "${peer_pub}",
         "client_real_ip": "${dst}",
-        "peer_spoof_ips": ["${spoof_dst}"],
+        "peer_spoof_ips": json.loads('${spoof_dst_json}'),
         "tun_addr": "${peer_tun_addr}",
     }]
     fwd = json.loads('${fwd_rules_json}')
@@ -629,7 +960,7 @@ if "${mode}" == "server":
     cfg.pop("server", None)
 else:
     cfg["server"] = {"address": "${dst}", "port": ${port}}
-    cfg["spoof"]["peer_spoof_ips"] = ["${spoof_dst}"]
+    cfg["spoof"]["peer_spoof_ips"] = json.loads('${spoof_dst_json}')
     cfg["crypto"]["peer_public_key"] = "${peer_pub}"
     cfg.pop("peers", None)
 
@@ -799,6 +1130,10 @@ cli_help() {
     p  "  timer-off <name>        Disable periodic restart timer"
     p  "  stats   <name>          Dump live admin-socket stats"
     p  "  bench   <name> [dur]    Run latency + throughput benchmark over the live tunnel"
+    p  "  spoof-list      <name>            List spoof IPs (outgoing + expected-incoming) with live health"
+    p  "  spoof-add       <name> <out|in> <ip>  Add a spoof IP (restart to take effect)"
+    p  "  spoof-remove    <name> <out|in> <ip>  Remove a spoof IP (restart to take effect)"
+    p  "  spoof-resurrect <name> [ip]       Force-clear quarantine on one IP, or all of them"
     p  "  remove  <name>          Remove service and config"
     p  "  keygen                  Generate a new key pair"
     br
@@ -839,6 +1174,58 @@ cli_cmd() {
             local dur="${2:-5}"
             "$BINARY" admin --socket "$sock" -H bench latency "${dur}s"
             "$BINARY" admin --socket "$sock" -H bench throughput "${dur}s" 4 ;;
+        spoof-list)
+            require_python
+            local cfg; cfg="$(cfg_path "$name")"
+            [[ -f "$cfg" ]] || die "Config not found: $cfg"
+            local peer_path; peer_path="$(_spoof_peer_path "$cfg")"
+            declare -A health=()
+            local ip st
+            while IFS=$'\t' read -r ip st; do
+                [[ -n "$ip" ]] && health["$ip"]="$st"
+            done < <(_spoof_health_snapshot "$name")
+            echo "Outgoing (spoof.source_ips):"
+            while read -r ip; do
+                [[ -z "$ip" ]] && continue
+                printf "  %-16s %s\n" "$ip" "${health[$ip]:-unknown (tunnel not running)}"
+            done < <(json_get_list "$cfg" "spoof.source_ips")
+            echo "Expected incoming ($peer_path):"
+            json_get_list "$cfg" "$peer_path" | sed 's/^/  /' ;;
+        spoof-add)
+            require_root
+            local cfg; cfg="$(cfg_path "$name")"
+            [[ -f "$cfg" ]] || die "Config not found: $cfg"
+            local which="${2:-}" ip="${3:-}"
+            [[ "$which" == "out" || "$which" == "in" ]] || die "Usage: spoof-add <name> <out|in> <ip>"
+            valid_ipv4 "$ip" || die "Invalid IPv4 address: $ip"
+            local path="spoof.source_ips"
+            [[ "$which" == "in" ]] && path="$(_spoof_peer_path "$cfg")"
+            json_list_add "$cfg" "$path" "$ip"
+            chmod 600 "$cfg"
+            pok "Added $ip ($which). Restart the tunnel for this to take effect." ;;
+        spoof-remove)
+            require_root
+            local cfg; cfg="$(cfg_path "$name")"
+            [[ -f "$cfg" ]] || die "Config not found: $cfg"
+            local which="${2:-}" ip="${3:-}"
+            [[ "$which" == "out" || "$which" == "in" ]] || die "Usage: spoof-remove <name> <out|in> <ip>"
+            local path="spoof.source_ips"
+            [[ "$which" == "in" ]] && path="$(_spoof_peer_path "$cfg")"
+            mapfile -t cur < <(json_get_list "$cfg" "$path")
+            (( ${#cur[@]} > 1 )) || die "Refusing to remove the last entry — at least one is required."
+            json_list_remove "$cfg" "$path" "$ip"
+            chmod 600 "$cfg"
+            pok "Removed $ip ($which). Restart the tunnel for this to take effect." ;;
+        spoof-resurrect)
+            require_python
+            local sock; sock="$(_admin_socket_for "$name")"
+            [[ -n "$sock" && -S "$sock" ]] || die "Admin socket not available (is the tunnel running?)"
+            local ip="${2:-}"
+            if [[ -n "$ip" ]]; then
+                "$BINARY" admin --socket "$sock" -H srcpool resurrect "$ip"
+            else
+                "$BINARY" admin --socket "$sock" -H srcpool resurrect
+            fi ;;
         remove)    require_root; _remove_tunnel "$name" ;;
         keygen)    require_binary; "$BINARY" keygen ;;
         help|--help|-h) cli_help ;;

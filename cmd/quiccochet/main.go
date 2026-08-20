@@ -29,6 +29,8 @@ var (
 	blue       = color.New(color.FgBlue).SprintFunc()
 	yellow     = color.New(color.FgYellow).SprintFunc()
 	green      = color.New(color.FgGreen).SprintFunc()
+	red        = color.New(color.FgRed).SprintFunc()
+	dim        = color.New(color.Faint).SprintFunc()
 )
 
 var mainCmd = &cobra.Command{

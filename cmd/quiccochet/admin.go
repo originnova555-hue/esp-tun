@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -104,16 +105,47 @@ capture profiles with, e.g.:
 	},
 }
 
+var adminSrcpoolCmd = &cobra.Command{
+	Use:   "srcpool resurrect [ip]",
+	Short: "Force-clear a quarantined spoof source IP's cooldown",
+	Long: `Force-clear the cooldown on a spoof source IP that 'admin stats' reports
+as quarantined, without waiting for the exponential backoff timer to
+expire — use this right after confirming whatever blocked that IP
+(carrier/firewall blip, misconfiguration) has been resolved.
+
+With no ip argument, clears every currently-quarantined entry.
+Client role only — the server side does not run a spoof source pool.`,
+	Args: cobra.RangeArgs(1, 2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if args[0] != "resurrect" {
+			return fmt.Errorf("unknown srcpool subcommand: %s (only 'resurrect' is supported)", args[0])
+		}
+		sock, err := resolveAdminSocket()
+		if err != nil {
+			return err
+		}
+		cmdLine := "srcpool resurrect"
+		if len(args) >= 2 {
+			cmdLine += " " + args[1]
+		}
+		resp, err := sendAdminCmd(sock, cmdLine, 10*time.Second)
+		if err != nil {
+			return err
+		}
+		return renderSrcpool(resp)
+	},
+}
+
 func init() {
 	adminCmd.PersistentFlags().StringVarP(&adminSocketPath, "socket", "s", "", "admin socket path (overrides config)")
 	adminCmd.PersistentFlags().BoolVarP(&adminHuman, "human", "H", false, "human-readable output instead of JSON")
 	// Cobra doesn't propagate SilenceUsage from parent to subcommands,
 	// so set it on each leaf. Errors remain visible via cobra's "Error:"
 	// prefix; we only drop the noisy usage block on failures.
-	for _, c := range []*cobra.Command{adminCmd, adminStatsCmd, adminBenchCmd, adminPprofCmd} {
+	for _, c := range []*cobra.Command{adminCmd, adminStatsCmd, adminBenchCmd, adminPprofCmd, adminSrcpoolCmd} {
 		c.SilenceUsage = true
 	}
-	adminCmd.AddCommand(adminStatsCmd, adminBenchCmd, adminPprofCmd)
+	adminCmd.AddCommand(adminStatsCmd, adminBenchCmd, adminPprofCmd, adminSrcpoolCmd)
 	mainCmd.AddCommand(adminCmd)
 }
 
@@ -209,7 +241,41 @@ func renderStats(resp string) error {
 		return nil
 	}
 	fmt.Printf("%s %s\n", green("▶"), strings.Join(parts, "  "))
+	renderSpoofIPs(os.Stdout, snap.SpoofIPs)
 	return nil
+}
+
+// renderSpoofIPs prints the per-spoof-source-IP runtime health carried
+// on the Snapshot, when the running backend has a SrcPool (client role
+// on the udp/raw/icmp/syn_udp transports). This reflects real observed
+// send/quarantine history, not a synthetic one-off probe: an entry the
+// pool has never had a reason to send through yet shows as "untested",
+// not "healthy" — the daemon hasn't actually exercised it.
+func renderSpoofIPs(w io.Writer, ips []admin.SpoofIPStatus) {
+	if len(ips) == 0 {
+		return
+	}
+	fmt.Fprintln(w, "  spoof IPs:")
+	for _, s := range ips {
+		var mark, state string
+		switch {
+		case s.SentCount == 0:
+			mark, state = dim("·"), dim("untested (no traffic sent yet)")
+		case s.Healthy:
+			mark, state = green("✔"), green("healthy")
+		default:
+			left := "expiring"
+			if s.CooldownLeftS > 0 {
+				left = fmt.Sprintf("%s left", humanUptime(s.CooldownLeftS))
+			}
+			mark, state = red("✘"), red(fmt.Sprintf("quarantined (level %d, %s)", s.CooldownLevel, left))
+		}
+		extra := ""
+		if s.SentCount > 0 {
+			extra = fmt.Sprintf("  sent=%d  last=%s ago", s.SentCount, humanUptime(s.LastSentAgoS))
+		}
+		fmt.Fprintf(w, "    %s %-16s %s%s\n", mark, s.IP, state, extra)
+	}
 }
 
 func renderBench(resp string) error {
@@ -274,6 +340,38 @@ func renderPprof(resp string) error {
 	} else {
 		fmt.Printf("%s pprof  not running\n", green("▶"))
 	}
+	return nil
+}
+
+func renderSrcpool(resp string) error {
+	if !adminHuman {
+		fmt.Println(resp)
+		return nil
+	}
+	var errResp struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(resp), &errResp); err == nil && errResp.Error != "" {
+		return fmt.Errorf("%s", errResp.Error)
+	}
+	var result admin.SrcpoolResurrectResult
+	if err := json.Unmarshal([]byte(resp), &result); err != nil {
+		fmt.Println(resp)
+		return nil
+	}
+	if result.IP != "" {
+		if result.Resurrected > 0 {
+			fmt.Printf("%s %s is healthy again\n", green("✔"), result.IP)
+		} else {
+			fmt.Printf("%s %s was not on cooldown (already healthy, or not in the pool)\n", dim("·"), result.IP)
+		}
+		return nil
+	}
+	word := "entries"
+	if result.Resurrected == 1 {
+		word = "entry"
+	}
+	fmt.Printf("%s %d %s resurrected\n", green("▶"), result.Resurrected, word)
 	return nil
 }
 
